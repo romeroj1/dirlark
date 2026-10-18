@@ -1,0 +1,8 @@
+/target/
+/dist/
+/.public-tools/
+.DS_Store
+__pycache__/
+*.pem
+*.key
+*.log

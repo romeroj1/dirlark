@@ -1,0 +1,24 @@
+name: Bug report
+description: Report a reproducible problem using synthetic data.
+body:
+  - type: markdown
+    attributes:
+      value: "Never include credentials, private keys, real LDAP records/LDIF or private endpoints. Use SECURITY.md for vulnerabilities."
+  - type: input
+    id: version
+    attributes:
+      label: Commit/version and operating system
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps and synthetic example
+      description: Include expected and actual behavior; redact private information.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Non-sensitive diagnostics
+      description: No credential/profile dumps or LDIF with real data.

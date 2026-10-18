@@ -1,0 +1,18 @@
+name: Feature request
+description: Describe a workflow or improvement.
+body:
+  - type: markdown
+    attributes:
+      value: "Use synthetic examples only. Never include credentials, real LDIF, private keys or directory data."
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or workflow
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior and alternatives
+    validations:
+      required: true

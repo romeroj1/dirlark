@@ -1,0 +1,15 @@
+DIRLARK
+Copyright 2026 DIRLARK contributors
+
+Inspired by Apache Directory Studio, an Apache Software Foundation project
+available under the Apache License, Version 2.0.
+https://directory.apache.org/studio/
+
+DIRLARK is an independent original implementation. Apache Directory Studio
+and Apache are trademarks of their respective owners. No endorsement implied.
+No upstream implementation or artwork is distributed in this repository.
+
+CODE_OF_CONDUCT.md adapts Contributor Covenant version 2.1 by Coraline Ada
+Ehmke and contributors, under Creative Commons Attribution 4.0 International.
+The reporting-contact text is customized. Original attribution is retained;
+see docs/licenses/Contributor-Covenant-CC-BY-4.0.md.

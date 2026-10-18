@@ -1,0 +1,41 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  native:
+    name: Native (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout source without persisted credentials
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install Linux native development libraries
+        if: runner.os == 'Linux'
+        run: python3 tools/public_ci.py linux-libs
+      - name: Install pinned check tools (Unix)
+        if: runner.os != 'Windows'
+        run: python3 tools/public_ci.py setup
+      - name: Install pinned check tools (Windows)
+        if: runner.os == 'Windows'
+        run: python tools/public_ci.py setup
+      - name: Native gate (Unix)
+        if: runner.os != 'Windows'
+        run: python3 tools/public_ci.py check
+      - name: Native gate (Windows)
+        if: runner.os == 'Windows'
+        run: python tools/public_ci.py check
