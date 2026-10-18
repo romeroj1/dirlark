@@ -7,13 +7,15 @@ use dirlark::{
 };
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
 use std::{
+    pin::Pin,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::{Arc, Mutex},
+    task::{Context, Poll},
     time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
+    net::{TcpListener, TcpStream},
 };
 use tokio_rustls::TlsAcceptor;
 
@@ -78,12 +80,48 @@ fn entry(id: &[u8], dn: &str, attrs: &[(&str, &[&str])]) -> Vec<u8> {
         .collect::<Vec<_>>();
     message(id, tlv(0x64, [tlv(4, dn), tlv(0x30, attrs)].concat()))
 }
+// Force a real TLS writer to retain its final record once. A socket may do
+// exactly this under backpressure: write_all accepts plaintext, not delivery.
+struct BackpressuredSocket {
+    inner: TcpStream,
+    pause_once: Arc<AtomicBool>,
+}
+impl AsyncRead for BackpressuredSocket {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+impl AsyncWrite for BackpressuredSocket {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.pause_once.swap(false, Ordering::AcqRel) {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 struct Mock {
     profile: Profile,
     _ca: tempfile::NamedTempFile,
     task: tokio::task::JoinHandle<()>,
     operations: Arc<Mutex<Vec<u8>>>,
     generated: Arc<AtomicUsize>,
+    buffered_tails: Arc<AtomicUsize>,
 }
 impl Drop for Mock {
     fn drop(&mut self) {
@@ -122,14 +160,22 @@ impl Mock {
         let seen = operations.clone();
         let generated = Arc::new(AtomicUsize::new(0));
         let generated_task = generated.clone();
+        let buffered_tails = Arc::new(AtomicUsize::new(0));
+        let buffered_task = buffered_tails.clone();
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 stream.set_nodelay(true).unwrap();
                 let acceptor = acceptor.clone();
                 let seen = seen.clone();
                 let generated = generated_task.clone();
+                let buffered_tails = buffered_task.clone();
                 tokio::spawn(async move {
-                    let Ok(mut stream) = acceptor.accept(stream).await else {
+                    let pause_once = Arc::new(AtomicBool::new(false));
+                    let socket = BackpressuredSocket {
+                        inner: stream,
+                        pause_once: pause_once.clone(),
+                    };
+                    let Ok(mut stream) = acceptor.accept(socket).await else {
                         return;
                     };
                     loop {
@@ -162,6 +208,9 @@ impl Mock {
                         let id = &f[0].1;
                         let (op, data) = &f[1];
                         seen.lock().unwrap().push(*op);
+                        let mut oversized = false;
+                        let mut fragmented = false;
+                        let mut truncated = false;
                         let reply = match op {
                             0x60 => result(id, 0x61, 0),
                             0x42 => return,
@@ -305,15 +354,32 @@ impl Mock {
                                     "dc=partial" => [e, result(id, 0x65, 4)].concat(),
                                     "dc=admin" => [e, result(id, 0x65, 11)].concat(),
                                     "dc=time" => [e, result(id, 0x65, 3)].concat(),
-                                    "dc=byte-overflow" => [
-                                        entry(
+                                    "dc=byte-overflow" | "dc=byte-overflow-fragmented" => {
+                                        oversized = true;
+                                        fragmented = base.ends_with("-fragmented");
+                                        [
+                                            entry(
+                                                id,
+                                                "cn=Large,dc=example",
+                                                &[(
+                                                    "description",
+                                                    &[&"x".repeat(paging::PAGE_BYTES)],
+                                                )],
+                                            ),
+                                            result(id, 0x65, 0),
+                                        ]
+                                        .concat()
+                                    }
+                                    "dc=byte-truncated" => {
+                                        truncated = true;
+                                        let mut reply = entry(
                                             id,
                                             "cn=Large,dc=example",
                                             &[("description", &[&"x".repeat(paging::PAGE_BYTES)])],
-                                        ),
-                                        result(id, 0x65, 0),
-                                    ]
-                                    .concat(),
+                                        );
+                                        reply.truncate(128);
+                                        reply
+                                    }
                                     "dc=referral" => [
                                         e,
                                         message(
@@ -339,7 +405,40 @@ impl Mock {
                             ),
                             _ => return,
                         };
-                        if stream.write_all(&reply).await.is_err() {
+                        if oversized {
+                            let (prefix, tail) = reply.split_at(reply.len() - 64);
+                            for chunk in prefix.chunks(if fragmented { 4096 } else { prefix.len() })
+                            {
+                                if stream.write_all(chunk).await.is_err() {
+                                    return;
+                                }
+                                if fragmented {
+                                    tokio::task::yield_now().await;
+                                }
+                            }
+                            if stream.flush().await.is_err() {
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            pause_once.store(true, Ordering::Release);
+                            if stream.write_all(tail).await.is_err() {
+                                return;
+                            }
+                            assert!(
+                                stream.get_ref().1.wants_write(),
+                                "fixture must retain the final TLS record"
+                            );
+                            buffered_tails.fetch_add(1, Ordering::Relaxed);
+                        } else if stream.write_all(&reply).await.is_err() {
+                            return;
+                        }
+                        // write_all accepts TLS plaintext; a final encrypted record can
+                        // remain buffered after socket backpressure. Drain it before
+                        // waiting for the next LDAP request, including on Windows.
+                        if stream.flush().await.is_err() {
+                            return;
+                        }
+                        if truncated {
                             return;
                         }
                     }
@@ -361,6 +460,7 @@ impl Mock {
             task,
             operations,
             generated,
+            buffered_tails,
         }
     }
 }
@@ -714,7 +814,72 @@ fn paged_children_and_limit_byte_guards_remain_bounded() {
             .await
             .err()
             .unwrap();
-        assert!(error.contains("2 MiB"));
+        assert!(
+            error.contains("2 MiB"),
+            "unexpected page error: {error}; buffered TLS tails: {}",
+            server.buffered_tails.load(Ordering::Relaxed)
+        );
         assert!(client.read("").await.is_ok());
+    });
+}
+
+#[test]
+fn oversized_pages_keep_byte_limit_under_concurrent_fragmented_tls_delivery() {
+    runtime().block_on(async {
+        let server = Mock::start("localhost", false).await;
+        let mut clients = tokio::task::JoinSet::new();
+        // Eight prescribed, independent requests: coverage under load, not retries.
+        for n in 0..8 {
+            let profile = server.profile.clone();
+            clients.spawn(async move {
+                let mut client = Directory::connect(&profile, "").await.unwrap();
+                let base = if n % 2 == 0 {
+                    "dc=byte-overflow"
+                } else {
+                    "dc=byte-overflow-fragmented"
+                };
+                let error = client
+                    .page(&scale_query(base), 25, None, None, &AtomicBool::new(false))
+                    .await
+                    .err()
+                    .unwrap();
+                assert!(
+                    error.contains("2 MiB"),
+                    "unexpected complete-page error: {error}"
+                );
+                assert!(
+                    client.read("").await.is_ok(),
+                    "connection must survive bounded page rejection"
+                );
+            });
+        }
+        while let Some(result) = clients.join_next().await {
+            result.unwrap();
+        }
+        assert_eq!(server.buffered_tails.load(Ordering::Relaxed), 8);
+    });
+}
+
+#[test]
+fn truncated_oversize_frame_is_transport_failure_not_a_fabricated_budget_error() {
+    runtime().block_on(async {
+        let server = Mock::start("localhost", false).await;
+        let mut client = Directory::connect(&server.profile, "").await.unwrap();
+        let error = client
+            .page(
+                &scale_query("dc=byte-truncated"),
+                25,
+                None,
+                None,
+                &AtomicBool::new(false),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            error,
+            "LDAP operation failed; verify TLS trust, hostname, connectivity and access rights"
+        );
+        assert_eq!(server.buffered_tails.load(Ordering::Relaxed), 0);
     });
 }
