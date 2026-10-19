@@ -56,7 +56,7 @@ fn record(path: &Path, event: Event) -> std::io::Result<()> {
     writeln!(
         file,
         "DIRLARK {} {} {}: {}",
-        option_env!("DIRLARK_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
+        crate::build_info::current().version,
         std::env::consts::OS,
         std::env::consts::ARCH,
         event.text()

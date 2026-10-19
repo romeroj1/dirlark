@@ -1,3 +1,4 @@
+mod about;
 mod certificate_view;
 #[cfg(debug_assertions)]
 pub mod evidence;
@@ -33,6 +34,7 @@ pub struct Workspace {
     busy: bool,
     connected: bool,
     appearance: egui::ThemePreference,
+    about_open: bool,
     include_credentials: bool,
     profiles: Vec<Profile>,
     profile: Profile,
@@ -50,6 +52,7 @@ pub struct Workspace {
     ordering_rule: String,
     seek_position: u32,
     selected: Option<Entry>,
+    pending_read: Option<String>,
     certificate_viewer: Option<certificate_view::Viewer>,
     attributes_height: f32,
     base: String,
@@ -118,6 +121,7 @@ impl Workspace {
             busy: false,
             connected: false,
             appearance,
+            about_open: false,
             include_credentials: false,
             profiles,
             base: profile.base_dn.clone(),
@@ -136,6 +140,7 @@ impl Workspace {
             ordering_rule: String::new(),
             seek_position: 1,
             selected: None,
+            pending_read: None,
             certificate_viewer: None,
             attributes_height: 260.0,
             filter: "(objectClass=*)".into(),
@@ -194,8 +199,16 @@ impl Workspace {
             self.note("Wait for the current operation".into());
             return;
         }
+        let reading = if let Request::Read(dn) = &request {
+            Some(dn.clone())
+        } else {
+            None
+        };
         match self.worker.sender.try_send((self.generation, request)) {
-            Ok(()) => self.busy = true,
+            Ok(()) => {
+                self.busy = true;
+                self.pending_read = reading;
+            }
             Err(_) => self.note("Background worker unavailable or queue full".into()),
         }
     }
@@ -272,6 +285,7 @@ impl Workspace {
         self.tree_focus_requested = None;
         self.pages.clear();
         self.selected = None;
+        self.pending_read = None;
         self.certificate_viewer = None;
         self.schema.clear();
         self.pending.clear();
@@ -347,6 +361,7 @@ impl Workspace {
                 }));
             }
             Response::Read(entry) => {
+                self.pending_read = None;
                 self.certificate_viewer = None;
                 self.selected = Some(entry);
                 self.attribute.clear();
@@ -663,7 +678,9 @@ impl Workspace {
                                     .push_id(("tree-node", dn), |ui| {
                                         ui.add(
                                             egui::Button::selectable(
-                                                self.selected.as_ref().is_some_and(|e| e.dn == *dn),
+                                                self.pending_read.as_deref().or_else(|| {
+                                                    self.selected.as_ref().map(|e| e.dn.as_str())
+                                                }) == Some(dn.as_str()),
                                                 label,
                                             )
                                             .truncate(),
@@ -671,6 +688,30 @@ impl Workspace {
                                     })
                                     .inner
                                     .on_hover_text(dn);
+                                if self
+                                    .pending_read
+                                    .as_deref()
+                                    .or_else(|| self.selected.as_ref().map(|e| e.dn.as_str()))
+                                    == Some(dn.as_str())
+                                {
+                                    let p = theme::colors(ui);
+                                    ui.painter().rect_filled(
+                                        egui::Rect::from_min_size(
+                                            response.rect.min,
+                                            egui::vec2(3.0, response.rect.height()),
+                                        ),
+                                        0.0,
+                                        p.accent,
+                                    );
+                                }
+                                if response.has_focus() {
+                                    ui.painter().rect_stroke(
+                                        response.rect.expand(2.0),
+                                        2.0,
+                                        egui::Stroke::new(1.0, theme::colors(ui).accent),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                }
                                 if self.tree_focus_requested == Some(index) {
                                     response.request_focus();
                                     self.tree_focus_requested = None;
@@ -741,6 +782,17 @@ impl Workspace {
         }
     }
     fn entry_view(&mut self, ui: &mut egui::Ui) {
+        if let Some(dn) = &self.pending_read {
+            ui.heading(rdn_label(dn));
+            output::show(ui, "Distinguished name", dn);
+            if self.busy {
+                ui.spinner();
+                ui.label("Loading entry attributes…");
+            } else {
+                ui.label("Entry details could not be loaded. Select the entry again to retry.");
+            }
+            return;
+        }
         let Some(entry) = self.selected.clone() else {
             ui.add_space(34.0);
             ui.heading(if self.connected {
@@ -757,7 +809,15 @@ impl Workspace {
             ui.small("Directory writes always require a separate review and explicit Apply.");
             return;
         };
-        ui.heading("Entry attributes");
+        ui.heading(format!(
+            "{} · {}",
+            if entry.dn.to_ascii_lowercase().starts_with("ou=") {
+                "OU"
+            } else {
+                "Entry"
+            },
+            rdn_label(&entry.dn)
+        ));
         ui.horizontal(|ui| {
             let width = (ui.available_width() - 80.0).max(80.0);
             ui.add_sized(
@@ -791,6 +851,16 @@ impl Workspace {
                 self.send(Request::Read(entry.dn.clone()));
             }
         });
+        if !entry.attrs.keys().any(|name| !credential_attribute(name)) {
+            ui.label(if self.profile.bind_dn.is_empty() {"No readable attributes for this entry. Anonymous access only exposes public attributes; log on or pick another entry."} else {"No readable attributes for this entry. Your current directory identity has no readable attributes; log on with another identity or pick another entry."});
+        }
+        if !entry
+            .attrs
+            .keys()
+            .any(|name| crate::certificates::kind(name).is_some())
+        {
+            ui.small("No certificates on this entry");
+        }
         ui.add_space(6.0);
         let name_width = (ui.available_width() * 0.27).clamp(100.0, 260.0);
         let value_width = (ui.available_width() - name_width - 36.0).max(100.0);
@@ -1473,6 +1543,13 @@ fn tree_rows(roots: &[String], cache: &PageCache) -> Vec<TreeRow> {
             });
             children(&entry.dn, depth + 1, cache, seen, rows);
         }
+        if cache.entries(&key).is_empty() && query.next.is_none() && query.warning.is_none() {
+            rows.push(TreeRow {
+                depth: depth + 1,
+                kind: TreeKind::Notice("No child entries".into()),
+                source: None,
+            });
+        }
         if let Some(message) = &query.warning {
             rows.push(TreeRow {
                 depth: depth + 1,
@@ -1579,6 +1656,9 @@ fn display(bytes: &[u8]) -> String {
 }
 impl Workspace {
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        if self.about_open {
+            return;
+        }
         if self.certificate_viewer.is_some() {
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.certificate_viewer = None;
@@ -1643,6 +1723,9 @@ impl Workspace {
                         ui.label(egui::RichText::new("Directory workbench").color(palette.muted));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("About").clicked() {
+                            self.about_open = true;
+                        }
                         let previous = self.appearance;
                         egui::ComboBox::from_id_salt("appearance")
                             .width(95.0)
@@ -1795,6 +1878,9 @@ impl Workspace {
         {
             self.certificate_viewer = None;
         }
+        if self.about_open {
+            self.about_open = about::show(&ctx);
+        }
         let capture_ready = !self.busy;
         #[cfg(debug_assertions)]
         let capture_ready = capture_ready || self.evidence_readonly;
@@ -1883,6 +1969,74 @@ fn attributes_splitter(ui: &mut egui::Ui, desired: &mut f32, available: f32) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn empty_and_pending_details_never_show_the_previous_entry() {
+        let ctx = egui::Context::default();
+        let mut w = Workspace::from_path(ctx.clone(), None, None, false);
+        for credentials_only in [false, true] {
+            w.profile.bind_dn = if credentials_only {
+                "cn=reader,dc=example,dc=test".into()
+            } else {
+                String::new()
+            };
+            w.selected = Some(Entry {
+                dn: "ou=Empty,dc=example,dc=test".into(),
+                attrs: if credentials_only {
+                    [("userPassword".into(), vec![b"synthetic-hidden".to_vec()])].into()
+                } else {
+                    Default::default()
+                },
+            });
+            let mut painted = String::new();
+            for _ in 0..2 {
+                let mut out = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1280.0, 900.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::CentralPanel::default().show(ui, |ui| w.entry_view(ui));
+                    },
+                );
+                painted.clear();
+                for shape in &out.shapes {
+                    rendered_text(&shape.shape, &mut painted);
+                }
+                out.textures_delta.clear();
+            }
+            assert!(painted.contains("No readable attributes"));
+            assert!(painted.contains(if credentials_only {
+                "current directory identity"
+            } else {
+                "Anonymous access"
+            }));
+            assert!(painted.contains("No certificates"));
+            assert!(!painted.contains("synthetic-hidden"));
+        }
+        w.pending_read = Some("ou=Loading,dc=example,dc=test".into());
+        w.busy = true;
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| w.entry_view(ui));
+        });
+        let mut painted = String::new();
+        for shape in &out.shapes {
+            rendered_text(&shape.shape, &mut painted);
+        }
+        out.textures_delta.clear();
+        assert!(painted.contains("Loading entry attributes"));
+        assert!(!painted.contains("ou=Empty"));
+        w.accept_response(
+            w.generation,
+            Response::Read(Entry {
+                dn: "ou=Loading,dc=example,dc=test".into(),
+                attrs: Default::default(),
+            }),
+        );
+        assert!(w.pending_read.is_none());
+    }
     #[test]
     fn splitter_pointer_and_keyboard_resize_with_bounds_and_reset() {
         let ctx = egui::Context::default();

@@ -3,6 +3,10 @@ use super::*;
 use std::collections::BTreeMap;
 
 pub const SCENES: &[&str] = &[
+    "about",
+    "selection-empty",
+    "selection-loading",
+    "selection-credentials",
     "connection",
     "keychain-unavailable",
     "browse",
@@ -62,6 +66,10 @@ pub fn workspace(ctx: egui::Context, scene: &str, path: PathBuf) -> Workspace {
     ];
     app.base = "ou=Engineering,dc=example,dc=test".into();
     app.status = "Choose a profile and connect over verified LDAPS".into();
+    if scene == "about" {
+        app.about_open = true;
+        return app;
+    }
     if scene == "keychain-unavailable" {
         app.credential_storage = Err(crate::profiles::CREDENTIALS_UNAVAILABLE.into());
     }
@@ -112,7 +120,14 @@ pub fn workspace(ctx: egui::Context, scene: &str, path: PathBuf) -> Workspace {
                 .into_iter()
                 .map(|ou| Entry {
                     dn: format!("ou={ou},dc=example,dc=test"),
-                    attrs: BTreeMap::from([("numSubordinates".into(), vec![b"200000".to_vec()])]),
+                    attrs: BTreeMap::from([(
+                        "numSubordinates".into(),
+                        vec![if scene.starts_with("selection-") && ou == "Engineering" {
+                            b"0".to_vec()
+                        } else {
+                            b"200000".to_vec()
+                        }],
+                    )]),
                 })
                 .collect(),
             next: None,
@@ -127,7 +142,14 @@ pub fn workspace(ctx: egui::Context, scene: &str, path: PathBuf) -> Workspace {
         Key::Children(app.base.clone()),
         query.clone(),
         100,
-        page(false),
+        if scene.starts_with("selection-") {
+            let mut empty = page(false);
+            empty.entries.clear();
+            empty.next = None;
+            empty
+        } else {
+            page(false)
+        },
         true,
     );
     if matches!(scene, "search" | "limit" | "busy" | "empty-results") {
@@ -150,6 +172,23 @@ pub fn workspace(ctx: egui::Context, scene: &str, path: PathBuf) -> Workspace {
         }
     } else {
         app.selected = Some(person(42));
+        if scene.starts_with("selection-") {
+            let dn = "ou=Engineering,dc=example,dc=test".to_string();
+            app.selected = Some(Entry {
+                dn: dn.clone(),
+                attrs: BTreeMap::new(),
+            });
+            if scene == "selection-loading" {
+                app.pending_read = Some(dn);
+                app.busy = true;
+            }
+            if scene == "selection-credentials" {
+                app.selected.as_mut().unwrap().attrs.insert(
+                    "userPassword".into(),
+                    vec![b"synthetic-hidden-value".to_vec()],
+                );
+            }
+        }
         app.attribute = "description".into();
         app.value = "Updated engineering account description".into();
         if matches!(scene, "preview" | "delete-preview") {
@@ -171,6 +210,10 @@ pub fn workspace(ctx: egui::Context, scene: &str, path: PathBuf) -> Workspace {
             app.tab = 3;
             app.transfer = ldif::export(&[person(42)]);
         }
+    }
+    if scene.starts_with("selection-") {
+        app.attribute.clear();
+        app.value.clear();
     }
     app
 }

@@ -2,10 +2,7 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     if std::env::args().any(|a| a == "--version") {
-        println!(
-            "DIRLARK {}",
-            option_env!("DIRLARK_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
-        );
+        println!("{}", dirlark::build_info::current().text());
         return ExitCode::SUCCESS;
     }
     dirlark::startup::install();

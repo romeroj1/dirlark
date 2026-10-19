@@ -1,0 +1,61 @@
+"""Shared archive/third-party notice layout; no network, credentials or publication."""
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import tarfile
+import zipfile
+
+def archive_tree(root, destination, zipped):
+    files = sorted(root.rglob("*"))
+    if any(p.is_symlink() for p in files):
+        raise RuntimeError("Refusing symlinks in package")
+    if zipped:
+        with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as archive:
+            for path in files:
+                if path.is_file():
+                    archive.write(path, path.relative_to(root.parent))
+    else:
+        with tarfile.open(destination, "w:gz") as archive:
+            archive.add(root, arcname=root.name, recursive=True)
+
+
+def license_paths(source):
+    """Include nested notices and embedded-font license texts, never font/code assets."""
+    selected = set()
+    for path in source.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(source)
+        name = path.name.upper()
+        notice = name.startswith(("LICENSE", "LICENCE", "COPYING", "COPYRIGHT", "NOTICE"))
+        text = path.suffix.lower() in (".txt", ".md", ".rst", ".html", "")
+        location = any(part.lower() in ("licenses", "licences", "fonts") for part in relative.parts[:-1])
+        if text and (notice or location):
+            selected.add(path)
+    return selected
+
+
+def licenses(root):
+    metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--locked", "--format-version", "1"]))
+    records = []
+    for package in metadata["packages"]:
+        name = package["name"] + "-" + package["version"]
+        source = Path(package["manifest_path"]).parent
+        # The workspace package already has explicit top-level notices. Scanning
+        # it recursively would also traverse target/dist and unrelated work files.
+        selected = ({source / name for name in ("LICENSE", "NOTICE")}
+                    if source.resolve() == Path.cwd().resolve() else license_paths(source))
+        if package.get("license_file"):
+            selected.add(source / package["license_file"])
+        copied = []
+        for path in sorted(selected):
+            if path.is_file() and path.resolve().is_relative_to(source.resolve()):
+                target = root / "third-party" / name / path.relative_to(source)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(path, target)
+                copied.append(target.relative_to(root).as_posix())
+        records.append({"name": package["name"], "version": package["version"], "license": package.get("license"), "notices": copied})
+    (root / "DEPENDENCIES.json").write_text(json.dumps(records, indent=2) + "\n")
+
+

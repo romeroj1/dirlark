@@ -1,0 +1,134 @@
+{
+  "name": "Draft alpha release",
+  "on": {
+    "push": {
+      "tags": [
+        "v*"
+      ]
+    }
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "concurrency": {
+    "group": "alpha-release-${{ github.ref }}",
+    "cancel-in-progress": false
+  },
+  "jobs": {
+    "build": {
+      "if": "github.repository == 'romeroj1/dirlark' && startsWith(github.ref, 'refs/tags/v')",
+      "permissions": {
+        "contents": "read"
+      },
+      "runs-on": "${{ matrix.os }}",
+      "timeout-minutes": 60,
+      "strategy": {
+        "fail-fast": false,
+        "max-parallel": 2,
+        "matrix": {
+          "include": [
+            {
+              "os": "windows-2025",
+              "platform": "windows"
+            },
+            {
+              "os": "macos-15",
+              "platform": "macos"
+            },
+            {
+              "os": "ubuntu-24.04",
+              "platform": "linux"
+            }
+          ]
+        }
+      },
+      "env": {
+        "RELEASE_TAG": "${{ github.ref_name }}"
+      },
+      "defaults": {
+        "run": {
+          "shell": "bash"
+        }
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
+          "with": {
+            "persist-credentials": false,
+            "fetch-depth": 0,
+            "ref": "${{ github.sha }}"
+          }
+        },
+        {
+          "name": "Linux build dependencies",
+          "if": "runner.os == 'Linux'",
+          "run": "python3 tools/public_ci.py linux-libs"
+        },
+        {
+          "name": "Pinned native toolchain and checks",
+          "run": "python tools/public_ci.py setup"
+        },
+        {
+          "name": "Native security and test gate",
+          "run": "python tools/public_ci.py check"
+        },
+        {
+          "name": "Build native unsigned archive",
+          "env": {
+            "RELEASE_PLATFORM": "${{ matrix.platform }}"
+          },
+          "run": "python tools/release_workflow.py build"
+        },
+        {
+          "name": "Upload this run only",
+          "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+          "with": {
+            "name": "alpha-${{ matrix.platform }}",
+            "path": "release-out/*",
+            "if-no-files-found": "error",
+            "retention-days": 7
+          }
+        }
+      ]
+    },
+    "publish": {
+      "needs": [
+        "build"
+      ],
+      "if": "github.repository == 'romeroj1/dirlark' && startsWith(github.ref, 'refs/tags/v')",
+      "permissions": {
+        "contents": "write"
+      },
+      "runs-on": "ubuntu-24.04",
+      "timeout-minutes": 15,
+      "env": {
+        "RELEASE_TAG": "${{ github.ref_name }}"
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
+          "with": {
+            "persist-credentials": false,
+            "fetch-depth": 0,
+            "ref": "${{ github.sha }}"
+          }
+        },
+        {
+          "uses": "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+          "with": {
+            "pattern": "alpha-*",
+            "path": "release-downloads",
+            "merge-multiple": false
+          }
+        },
+        {
+          "name": "Verify and create DRAFT pre-release only",
+          "env": {
+            "GH_TOKEN": "${{ github.token }}"
+          },
+          "run": "python3 tools/release_workflow.py draft"
+        }
+      ]
+    }
+  }
+}

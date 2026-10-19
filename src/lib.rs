@@ -1,3 +1,4 @@
+pub mod build_info;
 pub mod certificates;
 pub mod directory;
 pub mod ldif;

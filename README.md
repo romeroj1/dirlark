@@ -8,6 +8,25 @@ DIRLARK is a native Rust LDAP browser/editor for macOS, Linux and Windows. Brows
 
 Inspired by Apache Directory Studio; not affiliated with or endorsed by the Apache Software Foundation. This is original Rust code: no Apache/Eclipse implementation, icons or branding are included. See [NOTICE](NOTICE) and [provenance](docs/provenance.md).
 
+## Pre-release downloads and installation
+
+The first **0.1.0-alpha.1** release is being prepared; a changelog entry does not mean a download exists. Approved public binaries will be on [GitHub Releases](https://github.com/romeroj1/dirlark/releases), marked pre-release, with SHA256SUMS. No installer/admin privileges are required. [Alpha limitations](docs/releases/0.1.0-alpha.1.md) · [Changelog](CHANGELOG.md).
+
+| Platform | Planned download | Runtime evidence / limits |
+|---|---|---|
+| Windows x64 | ZIP, native MSVC build | Earlier no-GPU VM: anonymous verified LDAPS and certificate viewer confirmed; real-GPU/high-DPI/Credential Manager untested |
+| macOS arm64 | ZIP containing DIRLARK.app | Earlier Apple Silicon runtime confirmed; broader Keychain/managed-Mac flows untested |
+| Linux x86_64 | tar.gz | CI headless rendering/private Secret Service roundtrip; full interactive desktop flows untested |
+| Intel macOS | None | Not built/tested; excluded |
+
+Download the matching archive **and SHA256SUMS from the same release**. Before extracting, macOS: `shasum -a 256 <archive.zip>`; Linux: `sha256sum <archive.tar.gz>`; Windows PowerShell: `Get-FileHash <archive.zip> -Algorithm SHA256`. Compare the complete digest to that archive's manifest line. On macOS/Linux, `shasum -a 256 -c SHA256SUMS` / `sha256sum -c SHA256SUMS` verifies all listed files when downloaded. Hashes detect changed downloads, not a trusted publisher signature.
+
+- Windows: extract the ZIP and run dirlark.exe as a standard user. DirectX 12 hardware or WARP is required; `--software-rendering` selects WARP. SmartScreen/Smart App Control or company policy may block this unsigned application. Only use a permitted per-file exception after verifying the source/hash; ask your administrator if blocked. Never disable protections.
+- macOS arm64: extract, copy DIRLARK.app to a user-writable Applications folder, then open. This alpha is not Developer-ID signed/notarized. If permitted after verifying the source/hash, use System Settings → Privacy & Security → Open Anyway for this app. Managed policy may prohibit it; never disable Gatekeeper or remove quarantine globally. [Apple guidance](https://support.apple.com/en-us/102445).
+- Linux x86_64: extract and run `./dirlark`. This is not an AppImage; a compatible glibc and system OpenGL/EGL, X11/Wayland/xkbcommon and D-Bus libraries are required. BUILD.json records the build target/compiler. Missing/locked Secret Service must not cause plaintext password storage.
+
+Uninstall by removing the extracted directory/app. Profiles and native OS credential records remain separate user data; remove only your own DIRLARK records explicitly through OS settings if desired. Public builds use a separate profile/keychain namespace from internal builds. About and `--version` show identity; BUILD.json records exact public source provenance. Password persistence is experimental on untested platforms; leave it unchecked for session-only use. No automatic updater is included.
+
 ## Build and run
 
 Install [Rust through rustup](https://rustup.rs/) using its documented installation method. The repository pins Rust 1.97.1 and Cargo.lock. Linux needs a compiler, pkg-config, D-Bus development libraries and the X11/Wayland/OpenGL development stack; the public CI helper documents the Ubuntu package list. macOS needs Xcode Command Line Tools. Windows uses the MSVC Rust toolchain and Visual Studio C++ Build Tools/Windows SDK.
@@ -44,6 +63,6 @@ python3 tools/public_ci.py install-gitleaks
 make check
 ```
 
-On Windows, invoke `python tools/public_ci.py check` if Make/python3 is unavailable. Public CI runs the same native gate on Linux, macOS and Windows; the initial hosted Linux/macOS runs passed, and a mock TLS-delivery fix addresses the first Windows test failure. The corrected Windows hosted rerun remains pending. See [validation scope](docs/validation.md), [CONTRIBUTING](CONTRIBUTING.md), [Code of Conduct](CODE_OF_CONDUCT.md) and [SECURITY](SECURITY.md). Report bugs with synthetic data only.
+On Windows, invoke `python tools/public_ci.py check` if Make/python3 is unavailable. Public CI runs the same native gate on Linux, macOS and Windows; the corrected public snapshot passed all three hosted native gates (Windows, macOS and Linux). These checks do not establish interactive hardware or credential-store coverage; release candidates require their own checks. See [validation scope](docs/validation.md), [CONTRIBUTING](CONTRIBUTING.md), [Code of Conduct](CODE_OF_CONDUCT.md) and [SECURITY](SECURITY.md). Report bugs with synthetic data only.
 
 Licensed under [Apache-2.0](LICENSE). Dependencies and Contributor Covenant retain their own licenses and attribution.
