@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.0-alpha.2 — prepared, unreleased
+
+Packaging fix only; no application changes since alpha.1 (never published).
+
+- macOS: the app bundle now gets an ad-hoc seal covering Info.plist and resources, verified again after zip and extraction. alpha.1 downloads were reported by Gatekeeper as "damaged". Still not Developer-ID signed or notarized.
+
+See [alpha.2 notes](docs/releases/0.1.0-alpha.2.md).
+
 ## 0.1.0-alpha.1 — prepared, unreleased
 
 First public pre-release candidate of DIRLARK, an original Rust/egui LDAP browser/editor inspired by Apache Directory Studio.

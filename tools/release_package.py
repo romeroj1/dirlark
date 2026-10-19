@@ -48,6 +48,31 @@ def digest(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
+def verify_macos_bundle(app):
+    """The bundle must carry a valid seal that covers Info.plist, or Gatekeeper reports it as damaged."""
+    subprocess.run(['codesign', '--verify', '--deep', '--strict', '-vv', str(app)], check=True)
+    details = subprocess.run(['codesign', '-dv', '--verbose=4', str(app)], capture_output=True, text=True, check=True).stderr
+    if 'Info.plist entries=' not in details or 'Sealed Resources version=' not in details:
+        raise RuntimeError('macOS bundle seal does not cover Info.plist and resources')
+
+
+def seal_macos_bundle(app):
+    """Ad-hoc seal only (`-`): a valid bundle signature, not a publisher identity and not notarization."""
+    subprocess.run(['codesign', '--force', '--sign', '-', '--identifier', 'io.github.romeroj1.dirlark',
+                    '--timestamp=none', str(app)], check=True)
+    verify_macos_bundle(app)
+
+
+def verify_macos_archive(archive, name):
+    """Re-verify the seal after zip and extraction, the path a user's download takes."""
+    with tempfile.TemporaryDirectory(prefix='dirlark-extract-check-') as temp:
+        subprocess.run(['ditto', '-x', '-k', str(archive), temp], check=True)
+        app = Path(temp) / name / 'DIRLARK.app'
+        if not os.access(app / 'Contents' / 'MacOS' / 'dirlark', os.X_OK):
+            raise RuntimeError('Extracted macOS executable lost its execute bit')
+        verify_macos_bundle(app)
+
+
 def build(target_os, tag, output):
     stamp, commit = identity(tag)
     system, target, suffix = TARGETS[target_os]
@@ -70,6 +95,8 @@ def build(target_os, tag, output):
     metadata = {'version': stamp, 'source_commit': commit, 'built': built, 'target': target,
                 'compiler': subprocess.check_output(['rustc', '--version'], text=True).strip(),
                 'signed': False, 'notarized': False, 'source_repository': 'https://github.com/romeroj1/dirlark'}
+    if target_os == 'macos':
+        metadata['macos_seal'] = 'ad-hoc bundle seal only; no Developer ID signature, not notarized'
     name = f'dirlark-{stamp}-{target}'
     with tempfile.TemporaryDirectory(prefix='dirlark-public-package-') as temp:
         root = Path(temp) / name
@@ -84,6 +111,7 @@ def build(target_os, tag, output):
                               'CFBundleName': 'DIRLARK', 'CFBundlePackageType': 'APPL',
                               'CFBundleShortVersionString': '0.1.0', 'CFBundleVersion': '1',
                               'NSHighResolutionCapable': True, 'DIRLARKBuildIdentity': stamp}, stream)
+            seal_macos_bundle(root / 'DIRLARK.app')
         else:
             shutil.copy2(binary, root / binary.name)
         for source in ('LICENSE', 'NOTICE', 'README.md', 'CHANGELOG.md', 'SECURITY.md', f'docs/releases/{stamp}.md'):
@@ -92,6 +120,8 @@ def build(target_os, tag, output):
         (root / 'BUILD.json').write_text(json.dumps(metadata, indent=2) + '\n')
         archive = output / (name + suffix)
         archive_tree(root, archive, target_os != 'linux')
+        if target_os == 'macos':
+            verify_macos_archive(archive, name)
     (output / f'BUILD-{target}.json').write_text(json.dumps(metadata, indent=2) + '\n')
     (output / f'SHA256SUMS-{target}').write_text(digest(archive) + '  ' + archive.name + '\n')
     print('Created unsigned native alpha archive:', archive.name)

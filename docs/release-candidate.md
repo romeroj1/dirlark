@@ -8,7 +8,7 @@ No tag/release is authorized by this checklist. Agents prepare reviewed source/w
 - Run fresh-target native/static/security checks; require public native Windows/macOS/Linux checks green after Johann's push. Review workflow permissions with secops and the complete change with grok.
 - About and --version must identify the same alpha version, exact PUBLIC commit and UTC build date as BUILD.json. No internal source path, hostname, credential or signing identity in assets.
 - Verify SHA256SUMS before extraction, archive members/CRC, LICENSE/NOTICE/dependency notices, and a fresh download after draft creation. Checksums are not signatures.
-- Johann reviews source and policy/settings, creates the approved v0.1.0-alpha.1 tag on the public commit, and inspects the resulting **draft pre-release**. Nothing automatically publishes it. He makes it public only after these checks. No agent runs publish.py --answer-yes, tags or release commands.
+- Johann reviews source and policy/settings, creates the approved v0.1.0-alpha.2 tag on the public commit, and inspects the resulting **draft pre-release**. Nothing automatically publishes it. He makes it public only after these checks. No agent runs publish.py --answer-yes, tags or release commands.
 
 ## Windows x64 (Johann; disposable directory/account)
 

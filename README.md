@@ -10,7 +10,7 @@ Inspired by Apache Directory Studio; not affiliated with or endorsed by the Apac
 
 ## Pre-release downloads and installation
 
-The first **0.1.0-alpha.1** release is being prepared; a changelog entry does not mean a download exists. Approved public binaries will be on [GitHub Releases](https://github.com/romeroj1/dirlark/releases), marked pre-release, with SHA256SUMS. No installer/admin privileges are required. [Alpha limitations](docs/releases/0.1.0-alpha.1.md) · [Changelog](CHANGELOG.md).
+The first **0.1.0-alpha.2** release is being prepared; a changelog entry does not mean a download exists. Approved public binaries will be on [GitHub Releases](https://github.com/romeroj1/dirlark/releases), marked pre-release, with SHA256SUMS. No installer/admin privileges are required. [Alpha limitations](docs/releases/0.1.0-alpha.2.md) · [Changelog](CHANGELOG.md).
 
 | Platform | Planned download | Runtime evidence / limits |
 |---|---|---|

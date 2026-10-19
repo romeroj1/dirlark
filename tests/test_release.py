@@ -1,6 +1,10 @@
 """Public release contract; synthetic archives only, no tags, credentials or network."""
 import importlib.util
 import json
+import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -110,6 +114,33 @@ class Release(unittest.TestCase):
         with patch.dict('os.environ', {}, clear=True), patch.object(draft.subprocess, 'run') as run:
             with self.assertRaises(ValueError): draft.draft('v0.1.0-alpha.1', 'a' * 40, [])
             run.assert_not_called()
+
+    def test_macos_seal_runs_before_archive_and_is_reverified_after(self):
+        package = load('release_package')
+        calls = []
+        with patch.object(package.subprocess, 'run', side_effect=lambda cmd, **kw: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, '', 'Info.plist entries=1\nSealed Resources version=2')):
+            package.seal_macos_bundle(Path('DIRLARK.app'))
+        self.assertEqual(calls[0][:4], ['codesign', '--force', '--sign', '-'])
+        self.assertNotIn('--deep', calls[0])
+        self.assertIn('--strict', calls[1])
+        with patch.object(package.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', 'Info.plist=not bound\nSealed Resources=none')):
+            with self.assertRaises(RuntimeError): package.verify_macos_bundle(Path('DIRLARK.app'))
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'codesign and ditto are macOS tools')
+    def test_real_macos_bundle_survives_seal_zip_and_extract(self):
+        package, materials = load('release_package'), load('release_materials')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'pkg'
+            app = root / 'DIRLARK.app'
+            (app / 'Contents' / 'MacOS').mkdir(parents=True)
+            shutil.copyfile('/bin/echo', app / 'Contents' / 'MacOS' / 'dirlark')
+            os.chmod(app / 'Contents' / 'MacOS' / 'dirlark', 0o755)
+            (app / 'Contents' / 'Info.plist').write_bytes(b'<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>dirlark</string><key>CFBundleIdentifier</key><string>io.github.romeroj1.dirlark</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>')
+            with self.assertRaises(Exception): package.verify_macos_bundle(app)
+            package.seal_macos_bundle(app)
+            archive = Path(tmp) / 'pkg.zip'
+            materials.archive_tree(root, archive, True)
+            package.verify_macos_archive(archive, 'pkg')
 
 
 if __name__ == '__main__':
