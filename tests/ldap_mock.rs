@@ -337,6 +337,18 @@ impl Mock {
                                         "cn=schema",
                                         &[("attributeTypes", &["( 2.5.4.3 NAME 'cn' )"])],
                                     )
+                                } else if base == "cn=CredentialFixture,dc=example" {
+                                    entry(
+                                        id,
+                                        "cn=CredentialFixture,dc=example",
+                                        &[
+                                            ("objectClass", &["person"]),
+                                            ("cn", &["CredentialFixture"]),
+                                            ("sn", &["Example"]),
+                                            ("userPassword", &["{SSHA}synthetic-test-only-hash"]),
+                                            ("unicodePwd;binary", &["synthetic-unicode-pwd"]),
+                                        ],
+                                    )
                                 } else {
                                     entry(
                                         id,
@@ -545,14 +557,55 @@ fn tls_rejects_unknown_ca_wrong_host_and_expired_certificate() {
         let server = Mock::start("localhost", false).await;
         let mut unknown = server.profile.clone();
         unknown.ca_bundle.clear();
-        assert!(Directory::connect(&unknown, "").await.is_err());
+        let unknown_err = Directory::connect(&unknown, "").await.err().unwrap();
+        assert!(
+            unknown_err.contains("unknown CA") || unknown_err.contains("not trusted"),
+            "unexpected unknown CA error: {unknown_err}"
+        );
         assert!(server.operations.lock().unwrap().is_empty());
         let wrong = Mock::start("wrong.example", false).await;
-        assert!(Directory::connect(&wrong.profile, "").await.is_err());
+        let wrong_err = Directory::connect(&wrong.profile, "").await.err().unwrap();
+        assert!(
+            wrong_err.contains("hostname mismatch") && wrong_err.contains("localhost"),
+            "unexpected wrong host error: {wrong_err}"
+        );
         assert!(wrong.operations.lock().unwrap().is_empty());
         let expired = Mock::start("localhost", true).await;
-        assert!(Directory::connect(&expired.profile, "").await.is_err());
+        let expired_err = Directory::connect(&expired.profile, "")
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            expired_err.contains("expired"),
+            "unexpected expired cert error: {expired_err}"
+        );
         assert!(expired.operations.lock().unwrap().is_empty());
+    });
+}
+#[test]
+fn mock_server_credential_attributes_are_excluded_from_export_by_default_and_included_when_enabled()
+{
+    runtime().block_on(async {
+        let server = Mock::start("localhost", false).await;
+        let mut client = Directory::connect(&server.profile, "").await.unwrap();
+        let entry = client
+            .read("cn=CredentialFixture,dc=example")
+            .await
+            .unwrap();
+        assert!(entry.attrs.contains_key("userPassword"));
+        assert!(entry.attrs.contains_key("unicodePwd;binary"));
+        let safe_export = dirlark::ldif::export(std::slice::from_ref(&entry));
+        assert!(safe_export.contains("cn: CredentialFixture"));
+        assert!(!safe_export.contains("userPassword"));
+        assert!(!safe_export.contains("unicodePwd"));
+        assert!(!safe_export.contains("synthetic-test-only-hash"));
+        assert!(!safe_export.contains("synthetic-unicode-pwd"));
+        let explicit_export =
+            dirlark::ldif::export_with_credentials(std::slice::from_ref(&entry), true);
+        assert!(explicit_export.contains("WARNING"));
+        assert!(explicit_export.contains("userPassword: {SSHA}synthetic-test-only-hash"));
+        assert!(explicit_export.contains("unicodePwd;binary: synthetic-unicode-pwd"));
+        client.disconnect().await;
     });
 }
 

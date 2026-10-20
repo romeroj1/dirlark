@@ -73,6 +73,21 @@ def verify_macos_archive(archive, name):
         verify_macos_bundle(app)
 
 
+def remap_rustflags(extra=()):
+    """Strip build-machine usernames and local checkout/toolchain paths from release binaries."""
+    home = Path.home().resolve()
+    cargo_home = Path(os.environ.get('CARGO_HOME', home / '.cargo')).resolve()
+    rustup_home = Path(os.environ.get('RUSTUP_HOME', home / '.rustup')).resolve()
+    workspace = Path.cwd().resolve()
+    return ' '.join([
+        f'--remap-path-prefix={home}=/build/home',
+        f'--remap-path-prefix={rustup_home}=/build/rustup',
+        f'--remap-path-prefix={cargo_home}=/build/cargo',
+        f'--remap-path-prefix={workspace}=/build/src',
+        *extra,
+    ])
+
+
 def build(target_os, tag, output):
     stamp, commit = identity(tag)
     system, target, suffix = TARGETS[target_os]
@@ -83,10 +98,11 @@ def build(target_os, tag, output):
     output.mkdir(parents=True, exist_ok=False)
     built = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     env = dict(os.environ, DIRLARK_BUILD_VERSION=stamp, DIRLARK_BUILD_COMMIT=commit, DIRLARK_BUILD_DATE=built)
-    if target_os == 'windows':
-        # Portable ZIP: link the MSVC C runtime statically rather than silently
-        # depending on a separately installed Visual C++ redistributable.
-        env['CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS'] = '-C target-feature=+crt-static'
+    target_env_key = f"CARGO_TARGET_{target.upper().replace('-', '_')}_RUSTFLAGS"
+    # On Windows, also link the MSVC C runtime statically rather than silently
+    # depending on a separately installed Visual C++ redistributable.
+    extra_flags = ('-C', 'target-feature=+crt-static') if target_os == 'windows' else ()
+    env[target_env_key] = remap_rustflags(extra_flags)
     subprocess.run(['cargo', 'build', '--locked', '--release', '--bin', 'dirlark', '--target', target], env=env, check=True)
     binary = Path(os.environ.get('CARGO_TARGET_DIR', 'target')) / target / 'release' / ('dirlark.exe' if target_os == 'windows' else 'dirlark')
     observed = subprocess.check_output([str(binary.resolve()), '--version'], text=True)

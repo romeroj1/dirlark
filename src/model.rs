@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     pub id: uuid::Uuid,
@@ -10,6 +10,8 @@ pub struct Profile {
     pub base_dn: String,
     pub bind_dn: String,
     pub ca_bundle: String,
+    #[serde(default)]
+    pub password_saved: bool,
 }
 impl Default for Profile {
     fn default() -> Self {
@@ -20,6 +22,7 @@ impl Default for Profile {
             base_dn: String::new(),
             bind_dn: String::new(),
             ca_bundle: String::new(),
+            password_saved: false,
         }
     }
 }
@@ -182,6 +185,37 @@ pub fn smart_filter(input: &str) -> Result<String, String> {
     }
     Ok(filter)
 }
+pub fn expand_local_path_with_home(
+    raw: &str,
+    home: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "Cannot access file: enter a file path (for example ~/Downloads/entries.ldif)".into(),
+        );
+    }
+    if trimmed == "~" || trimmed == "$HOME" {
+        return home.map(std::path::Path::to_path_buf).ok_or_else(|| {
+            "Cannot resolve ~: home directory is unavailable; enter a full file path".into()
+        });
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix("~\\"))
+        .or_else(|| trimmed.strip_prefix("$HOME/"))
+        .or_else(|| trimmed.strip_prefix("$HOME\\"))
+    {
+        let base =
+            home.ok_or("Cannot resolve ~: home directory is unavailable; enter a full file path")?;
+        return Ok(base.join(rest));
+    }
+    Ok(std::path::PathBuf::from(trimmed))
+}
+pub fn expand_local_path(raw: &str) -> Result<std::path::PathBuf, String> {
+    let home = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf());
+    expand_local_path_with_home(raw, home.as_deref())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,13 +311,15 @@ mod tests {
     #[test]
     fn profile_has_no_password_field() {
         let data = serde_json::to_value(Profile::default()).unwrap();
-        assert!(
-            !data
-                .as_object()
-                .unwrap()
-                .keys()
-                .any(|k| k.contains("password"))
-        );
+        for (key, value) in data.as_object().unwrap() {
+            if key.contains("password") {
+                assert_eq!(key, "password_saved");
+                assert!(
+                    value.is_boolean(),
+                    "password_saved must be a non-secret boolean flag"
+                );
+            }
+        }
     }
     #[test]
     fn filter_attribute_names_reject_injection_and_non_ascii() {
@@ -302,5 +338,23 @@ mod tests {
         for name in ["cn", "givenName", "cn;lang-en", "1.2.3"] {
             assert!(equality_filter(name, "value").is_ok(), "{name}");
         }
+    }
+    #[test]
+    fn local_path_expansion_supports_tilde_home_and_rejects_empty() {
+        let home = std::path::Path::new("/tmp/dirlark-home");
+        assert!(expand_local_path_with_home("   ", Some(home)).is_err());
+        assert_eq!(
+            expand_local_path_with_home("~/Downloads/export.ldif", Some(home)).unwrap(),
+            std::path::PathBuf::from("/tmp/dirlark-home/Downloads/export.ldif")
+        );
+        assert_eq!(
+            expand_local_path_with_home("$HOME/certs/ca.pem", Some(home)).unwrap(),
+            std::path::PathBuf::from("/tmp/dirlark-home/certs/ca.pem")
+        );
+        assert!(expand_local_path_with_home("~/export.ldif", None).is_err());
+        assert_eq!(
+            expand_local_path_with_home("/var/tmp/entries.ldif", None).unwrap(),
+            std::path::PathBuf::from("/var/tmp/entries.ldif")
+        );
     }
 }

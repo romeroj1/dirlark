@@ -217,6 +217,19 @@ fn safe(text: String) -> String {
     }
     result
 }
+fn format_asn1_time(t: ASN1Time) -> String {
+    let utc = ASN1Time::from_timestamp(0).unwrap().to_datetime().offset();
+    let dt = t.to_datetime().to_offset(utc);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        dt.year(),
+        u8::from(dt.month()),
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second()
+    )
+}
 fn decode(der: &[u8], now: i64) -> Result<Certificate, &'static str> {
     if der.len() > MAX_CERT {
         return Err(LIMIT);
@@ -245,14 +258,8 @@ fn decode(der: &[u8], now: i64) -> Result<Certificate, &'static str> {
     add("Subject", cert.subject().to_string());
     add("Issuer", cert.issuer().to_string());
     add("Serial number", cert.raw_serial_as_string());
-    add(
-        "Not before",
-        cert.validity().not_before.to_datetime().to_string(),
-    );
-    add(
-        "Not after",
-        cert.validity().not_after.to_datetime().to_string(),
-    );
+    add("Not before", format_asn1_time(cert.validity().not_before));
+    add("Not after", format_asn1_time(cert.validity().not_after));
     let end = cert.validity().not_after.timestamp();
     let start = cert.validity().not_before.timestamp();
     add(
@@ -442,4 +449,24 @@ fn decode(der: &[u8], now: i64) -> Result<Certificate, &'static str> {
         pem: format!("-----BEGIN CERTIFICATE-----\n{lines}\n-----END CERTIFICATE-----\n"),
         der_base64,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn asn1_time_with_nonzero_offset_formats_in_utc() {
+        let gt_plus =
+            x509_parser::der_parser::asn1_rs::GeneralizedTime::from_bytes(b"20240101020000+0200")
+                .unwrap();
+        let t_plus = ASN1Time::new(gt_plus.utc_datetime().unwrap());
+        assert_eq!(format_asn1_time(t_plus), "2024-01-01 00:00:00 UTC");
+
+        let gt_minus =
+            x509_parser::der_parser::asn1_rs::GeneralizedTime::from_bytes(b"20291231190000-0500")
+                .unwrap();
+        let t_minus = ASN1Time::new(gt_minus.utc_datetime().unwrap());
+        assert_eq!(format_asn1_time(t_minus), "2030-01-01 00:00:00 UTC");
+    }
 }

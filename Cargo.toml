@@ -9,7 +9,7 @@ description = "Native LDAP directory workbench"
 [dependencies]
 base64 = "0.22"
 directories = "6"
-eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+eframe = { version = "0.37", default-features = false, features = ["clipboard", "default_fonts", "glow", "x11", "wayland"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 keyring = { package = "keyring-core", version = "1.0.1" }
 ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"] }
@@ -36,7 +36,7 @@ unsafe_code = "forbid"
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-eframe = { version = "0.37", default-features = false, features = ["wgpu_no_default_features"] }
+eframe = { version = "0.37", default-features = false, features = ["clipboard", "wgpu_no_default_features"] }
 wgpu = { version = "30.0", default-features = false, features = ["std", "wgsl", "dx12"] }
 rfd = { version = "0.17.2", default-features = false }
 windows-native-keyring-store = { version = "1.1.0", default-features = false }

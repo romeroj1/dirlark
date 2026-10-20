@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.0-alpha.3 — prepared, unreleased
+
+Usability, credential-management, diagnostics and packaging fixes following manual macOS testing of alpha.2 (never published). Still unsigned and not Developer-ID signed or notarized.
+
+- System clipboard (`arboard` via `eframe`) enabled on macOS, Linux and Windows so copy/paste works across applications, plus Enter-to-connect in endpoint, base DN, bind DN and password fields.
+- Saved-password indicator and explicit **Forget** button backed by OS keychain probing and verified deletion on the stored profile identity, optional keychain cleanup on profile delete, persistent Dark/Light theme selection, and Save profile kept available while connected.
+- Actionable TLS certificate/hostname/CA error messages, human-readable LDAP result-code explanations, preserved hand-edited search filters, clearer LDIF preview/import errors, `~` path expansion and Finder/Explorer path hints, and a **Copy log** button.
+- Scrollable unclipped About window, UTC-normalized `YYYY-MM-DD HH:MM:SS UTC` certificate validity timestamps, and `--remap-path-prefix` stripping of local build paths from packaged binaries.
+
+See [alpha.3 notes](docs/releases/0.1.0-alpha.3.md).
+
 ## 0.1.0-alpha.2 — prepared, unreleased
 
 Packaging fix only; no application changes since alpha.1 (never published).

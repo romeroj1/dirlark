@@ -3,25 +3,41 @@ use super::{egui, output};
 pub fn show(ctx: &egui::Context) -> bool {
     let mut close = false;
     let response = egui::Modal::new(egui::Id::unique("about-dirlark")).show(ctx, |ui| {
-        ui.set_width((ctx.content_rect().width() - 64.0).clamp(240.0, 520.0));
+        ui.set_width((ctx.content_rect().width() - 64.0).clamp(260.0, 640.0));
         ui.heading("About DIRLARK");
         ui.label("A native LDAP directory workbench");
-        egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 180.0).max(120.0)).show(ui, |ui| {
-            let build = crate::build_info::current();
-            output::show(ui, "Version", build.version);
-            output::show(ui, "Commit", build.commit);
-            output::show(ui, "Build date (UTC)", build.built);
-            output::show(ui, "Licence", "Apache-2.0");
-            output::show(ui, "Build information", &build.text());
-            ui.hyperlink_to("Source repository", "https://github.com/romeroj1/dirlark");
-            ui.hyperlink_to("Notices", "https://github.com/romeroj1/dirlark/blob/main/NOTICE");
-            ui.hyperlink_to("Apache-2.0 licence", "https://github.com/romeroj1/dirlark/blob/main/LICENSE");
-            ui.separator();
-            ui.label("Verified LDAPS only. Directory writes require preview and explicit Apply.");
-            ui.label("Credential attributes are hidden and excluded from LDIF export by default. Password persistence is opt-in through your OS credential store; there is no plaintext fallback.");
-            ui.label("Certificate inspection is display only: signature, chain, revocation and hostname are not validated.");
-        });
-        if ui.button("Close About").clicked() { close = true; }
+        egui::ScrollArea::vertical()
+            .id_salt("about-scroll")
+            .max_height((ctx.content_rect().height() - 140.0).max(200.0))
+            .show(ui, |ui| {
+                let build = crate::build_info::current();
+                ui.columns(2, |cols| {
+                    output::show(&mut cols[0], "Version", build.version);
+                    output::show(&mut cols[0], "Build date (UTC)", build.built);
+                    output::show(&mut cols[1], "Commit", build.commit);
+                    output::show(&mut cols[1], "Licence", "Apache-2.0");
+                });
+                output::show(ui, "Build information", &build.text());
+                ui.horizontal_wrapped(|ui| {
+                    ui.small("Source repository (LICENSE & NOTICE):");
+                    ui.code("https://github.com/romeroj1/dirlark");
+                    if ui.small_button("Copy URL").clicked() {
+                        ui.ctx()
+                            .copy_text("https://github.com/romeroj1/dirlark".into());
+                    }
+                });
+                ui.separator();
+                ui.small(
+                    "Verified LDAPS only. Directory writes require preview and explicit Apply.",
+                );
+                ui.small("Credential attributes are hidden and excluded from LDIF export by default. Password persistence is opt-in through your OS credential store; there is no plaintext fallback.");
+                ui.small("Certificate inspection is display only: signature, chain, revocation and hostname are not validated.");
+                ui.add_space(4.0);
+            });
+        ui.add_space(4.0);
+        if ui.button("Close About").clicked() {
+            close = true;
+        }
     });
     !(close || response.should_close())
 }
@@ -45,12 +61,13 @@ mod tests {
             }
         }
         let ctx = egui::Context::default();
+        let mut labels = String::new();
         for _ in 0..3 {
             let mut out = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
-                        egui::vec2(1000.0, 1000.0),
+                        egui::vec2(1160.0, 760.0),
                     )),
                     ..Default::default()
                 },
@@ -59,16 +76,19 @@ mod tests {
                 },
             );
             out.textures_delta.clear();
-            let mut labels = String::new();
+            labels.clear();
             for s in out.shapes {
-                text(&s.shape, &mut labels)
-            }
-            if labels.contains("About DIRLARK") {
-                assert!(labels.contains("Version"));
-                assert!(labels.matches("Copy").count() >= 5);
-                return;
+                text(&s.shape, &mut labels);
             }
         }
-        panic!("About did not render");
+        assert!(labels.contains("About DIRLARK"), "{labels}");
+        assert!(labels.contains("Version"), "{labels}");
+        assert!(labels.contains("Source repository"), "{labels}");
+        assert!(
+            labels.contains("Certificate inspection is display only"),
+            "{labels}"
+        );
+        assert!(labels.contains("Close About"), "{labels}");
+        assert!(labels.matches("Copy").count() >= 5, "{labels}");
     }
 }

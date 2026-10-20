@@ -41,6 +41,10 @@ pub struct Workspace {
     path: Option<PathBuf>,
     password: Zeroizing<String>,
     remember: bool,
+    connecting_saves_or_uses_keychain: bool,
+    credential_locked_notice: Option<String>,
+    confirm_delete_profile: bool,
+    delete_profile_credential: bool,
     credential_storage: Result<(), String>,
     roots: Vec<String>,
     tree_focus_requested: Option<usize>,
@@ -61,6 +65,7 @@ pub struct Workspace {
     scope: usize,
     query_details: bool,
     quick_search: String,
+    last_quick_filter: String,
     builder_attr: String,
     builder_value: String,
     tab: usize,
@@ -100,10 +105,9 @@ impl Workspace {
         smoke: bool,
     ) -> Self {
         theme::install(&ctx);
-        let appearance = ctx.options(|o| o.theme_preference);
         let loaded = path
             .as_ref()
-            .map(|p| crate::profiles::load_with_legacy(p, legacy.as_deref()))
+            .map(|p| crate::profiles::load_config_with_legacy(p, legacy.as_deref()))
             .unwrap_or_else(|| Err("No local config directory available".into()));
         let status = loaded
             .as_ref()
@@ -111,8 +115,71 @@ impl Workspace {
             .cloned()
             .unwrap_or_else(|| "Choose a profile and connect over verified LDAPS".into());
         let path = if loaded.is_err() { None } else { path };
-        let profiles = loaded.unwrap_or_default();
+        let config = loaded.unwrap_or_default();
+        let appearance = match config.theme.as_deref() {
+            Some("dark") => {
+                ctx.set_theme(egui::ThemePreference::Dark);
+                egui::ThemePreference::Dark
+            }
+            Some("light") => {
+                ctx.set_theme(egui::ThemePreference::Light);
+                egui::ThemePreference::Light
+            }
+            _ => ctx.options(|o| o.theme_preference),
+        };
+        let mut profiles = config.profiles;
+        let mut flags_changed = false;
+        let mut locked_notice: Option<String> = None;
+        if !smoke {
+            for p in &mut profiles {
+                if p.bind_dn.is_empty() {
+                    if p.password_saved {
+                        p.password_saved = false;
+                        flags_changed = true;
+                    }
+                    continue;
+                }
+                match crate::profiles::probe_saved_password(p) {
+                    crate::profiles::SavedCredentialState::Present => {
+                        if !p.password_saved {
+                            p.password_saved = true;
+                            flags_changed = true;
+                        }
+                    }
+                    crate::profiles::SavedCredentialState::Missing => {
+                        if p.password_saved {
+                            p.password_saved = false;
+                            flags_changed = true;
+                        }
+                    }
+                    crate::profiles::SavedCredentialState::LockedOrDenied(msg) => {
+                        if !p.password_saved {
+                            p.password_saved = true;
+                            flags_changed = true;
+                        }
+                        if locked_notice.is_none() {
+                            locked_notice = Some(msg.to_string());
+                        }
+                    }
+                    crate::profiles::SavedCredentialState::StoreUnavailable(_) => {}
+                }
+            }
+            if flags_changed
+                && let Some(p) = path.as_ref()
+                && p.try_exists().unwrap_or(false)
+            {
+                let _ = crate::profiles::save_with_theme(p, &profiles, config.theme.as_deref());
+            }
+        }
         let profile = profiles.first().cloned().unwrap_or_default();
+        let remember = !profile.bind_dn.is_empty() && profile.password_saved;
+        let mut logs = VecDeque::new();
+        let status = if let Some(msg) = &locked_notice {
+            logs.push_back(msg.clone());
+            msg.clone()
+        } else {
+            status
+        };
         Self {
             #[cfg(debug_assertions)]
             evidence_readonly: false,
@@ -128,7 +195,11 @@ impl Workspace {
             profile,
             path,
             password: Zeroizing::new(String::new()),
-            remember: false,
+            remember,
+            connecting_saves_or_uses_keychain: false,
+            credential_locked_notice: locked_notice,
+            confirm_delete_profile: false,
+            delete_profile_credential: true,
             credential_storage: Ok(()),
             roots: vec![],
             tree_focus_requested: None,
@@ -142,12 +213,13 @@ impl Workspace {
             selected: None,
             pending_read: None,
             certificate_viewer: None,
-            attributes_height: 260.0,
+            attributes_height: DEFAULT_ATTRIBUTES_HEIGHT,
             filter: "(objectClass=*)".into(),
             attrs: "*".into(),
             scope: 2,
             query_details: false,
             quick_search: String::new(),
+            last_quick_filter: String::new(),
             builder_attr: "cn".into(),
             builder_value: String::new(),
             tab: 0,
@@ -164,7 +236,7 @@ impl Workspace {
             schema: vec![],
             schema_filter: String::new(),
             status,
-            logs: VecDeque::new(),
+            logs,
             smoke: smoke.then(crate::smoke::SmokeCapture::new),
             connection_screen_visible: false,
             #[cfg(test)]
@@ -330,7 +402,40 @@ impl Workspace {
             }
             Response::Connected(roots) => {
                 self.connected = true;
+                if self.base.trim().is_empty()
+                    && let Some(first) = roots.first()
+                {
+                    self.base = first.clone();
+                }
                 self.roots = roots;
+                let used_or_saved_keychain = self.connecting_saves_or_uses_keychain
+                    || (!self.profile.bind_dn.is_empty()
+                        && self.password.is_empty()
+                        && matches!(
+                            crate::profiles::probe_saved_password(&self.profile),
+                            crate::profiles::SavedCredentialState::Present
+                                | crate::profiles::SavedCredentialState::LockedOrDenied(_)
+                        ));
+                if used_or_saved_keychain && !self.profile.bind_dn.is_empty() {
+                    self.profile.password_saved = true;
+                    self.remember = true;
+                    self.credential_locked_notice = None;
+                    if let Some(saved) = self.profiles.iter_mut().find(|p| {
+                        p.id == self.profile.id
+                            && p.endpoint == self.profile.endpoint
+                            && p.bind_dn == self.profile.bind_dn
+                    }) {
+                        saved.password_saved = true;
+                        if let Some(path) = &self.path {
+                            let _ = crate::profiles::save_with_theme(
+                                path,
+                                &self.profiles,
+                                theme_name(self.appearance).as_deref(),
+                            );
+                        }
+                    }
+                }
+                self.connecting_saves_or_uses_keychain = false;
                 self.note("Connected · TLS certificate and hostname verified".into());
             }
             Response::Disconnected => {
@@ -342,27 +447,46 @@ impl Workspace {
                 let count = page.entries.len();
                 let mode = page.mode;
                 let total = page.total;
+                let has_more = page.next.is_some();
                 let warning = page.warning.clone();
                 self.release
                     .extend(self.pages.insert(key.clone(), query, size, *page, reset));
+                let cached_rows = self.pages.entries(&key).len();
                 let evicted = self.pages.get(&key).is_some_and(|q| q.evicted);
                 self.note(warning.unwrap_or_else(|| {
-                    format!(
-                        "Fetched {count} rows · {mode:?}{}{}",
-                        total
-                            .map(|n| format!(" · server VLV count {n}"))
-                            .unwrap_or_default(),
-                        if evicted {
-                            " · earlier pages evicted"
-                        } else {
-                            ""
-                        }
-                    )
+                    if has_more {
+                        format!(
+                            "Fetched {count} rows ({cached_rows} cached) · {mode:?}{}{}",
+                            total
+                                .map(|n| format!(" · server VLV count {n}"))
+                                .unwrap_or_default(),
+                            if evicted {
+                                " · earlier pages evicted"
+                            } else {
+                                ""
+                            }
+                        )
+                    } else {
+                        format!(
+                            "End of results · {cached_rows} rows ({count} in final page) · {mode:?}{}{}",
+                            total
+                                .map(|n| format!(" · server VLV count {n}"))
+                                .unwrap_or_default(),
+                            if evicted {
+                                " · earlier pages evicted"
+                            } else {
+                                ""
+                            }
+                        )
+                    }
                 }));
             }
             Response::Read(entry) => {
                 self.pending_read = None;
                 self.certificate_viewer = None;
+                if self.base.trim().is_empty() && !entry.dn.is_empty() {
+                    self.base = entry.dn.clone();
+                }
                 self.selected = Some(entry);
                 self.attribute.clear();
                 self.value.clear();
@@ -398,7 +522,65 @@ impl Workspace {
             Response::Saved => {
                 self.note("Profile settings saved; no passwords written to config".into())
             }
+            Response::PasswordForgotten { id, removed } => {
+                if self.profile.id == id {
+                    self.profile.password_saved = false;
+                    self.remember = false;
+                    self.credential_locked_notice = None;
+                }
+                for p in &mut self.profiles {
+                    if p.id == id {
+                        p.password_saved = false;
+                    }
+                }
+                self.note(
+                    if removed {
+                        "Saved password removed from OS keychain"
+                    } else {
+                        "Nothing to forget: no saved password was found in the OS keychain"
+                    }
+                    .into(),
+                );
+            }
+            Response::ProfileDeleted {
+                id,
+                removed_credential,
+            } => {
+                self.profiles.retain(|p| p.id != id);
+                self.confirm_delete_profile = false;
+                if self.profile.id == id {
+                    let next = self.profiles.first().cloned().unwrap_or_default();
+                    self.select_profile(next);
+                }
+                self.note(
+                    if removed_credential {
+                        "Profile deleted and saved password removed from OS keychain"
+                    } else {
+                        "Profile deleted"
+                    }
+                    .into(),
+                );
+            }
             Response::Error(message) => {
+                self.connecting_saves_or_uses_keychain = false;
+                if message.contains("not found in the OS keychain") {
+                    self.profile.password_saved = false;
+                    self.remember = false;
+                    self.credential_locked_notice = None;
+                    if let Some(saved) = self.profiles.iter_mut().find(|p| p.id == self.profile.id)
+                    {
+                        saved.password_saved = false;
+                        if let Some(path) = &self.path {
+                            let _ = crate::profiles::save_with_theme(
+                                path,
+                                &self.profiles,
+                                theme_name(self.appearance).as_deref(),
+                            );
+                        }
+                    }
+                } else if message.contains("access denied or keychain locked") {
+                    self.credential_locked_notice = Some(message.clone());
+                }
                 if let Some((key, _)) = active {
                     self.pages.invalidate(
                         &key,
@@ -409,6 +591,58 @@ impl Workspace {
             }
         }
     }
+    fn saved_profile(&self) -> Option<&Profile> {
+        self.profiles.iter().find(|p| p.id == self.profile.id)
+    }
+    fn credential_target_profile(&self) -> Profile {
+        self.saved_profile()
+            .cloned()
+            .unwrap_or_else(|| self.profile.clone())
+    }
+    fn select_profile(&mut self, mut profile: Profile) {
+        self.credential_locked_notice = None;
+        if self.smoke.is_none() && !profile.bind_dn.is_empty() {
+            match crate::profiles::probe_saved_password(&profile) {
+                crate::profiles::SavedCredentialState::Present => {
+                    profile.password_saved = true;
+                }
+                crate::profiles::SavedCredentialState::Missing => {
+                    profile.password_saved = false;
+                }
+                crate::profiles::SavedCredentialState::LockedOrDenied(msg) => {
+                    profile.password_saved = true;
+                    self.credential_locked_notice = Some(msg.to_string());
+                    self.note(msg.into());
+                }
+                crate::profiles::SavedCredentialState::StoreUnavailable(_) => {}
+            }
+            if let Some(saved) = self.profiles.iter_mut().find(|p| {
+                p.id == profile.id && p.endpoint == profile.endpoint && p.bind_dn == profile.bind_dn
+            }) && saved.password_saved != profile.password_saved
+            {
+                saved.password_saved = profile.password_saved;
+                if let Some(path) = &self.path
+                    && path.try_exists().unwrap_or(false)
+                {
+                    let _ = crate::profiles::save_with_theme(
+                        path,
+                        &self.profiles,
+                        theme_name(self.appearance).as_deref(),
+                    );
+                }
+            }
+        } else if profile.bind_dn.is_empty() {
+            profile.password_saved = false;
+        }
+        self.remember = !profile.bind_dn.is_empty()
+            && profile.password_saved
+            && self.credential_storage.is_ok();
+        self.base = profile.base_dn.clone();
+        self.profile = profile;
+        self.password = Zeroizing::new(String::new());
+        self.confirm_delete_profile = false;
+        self.delete_profile_credential = true;
+    }
     fn connect(&mut self) {
         if self.connected || self.busy {
             return;
@@ -416,6 +650,8 @@ impl Workspace {
         self.generation += 1;
         self.clear_data();
         self.base = self.profile.base_dn.clone();
+        self.connecting_saves_or_uses_keychain =
+            !self.profile.bind_dn.is_empty() && (self.remember || self.password.is_empty());
         let password = std::mem::replace(&mut self.password, Zeroizing::new(String::new()));
         self.send(Request::Connect(
             self.profile.clone(),
@@ -436,39 +672,181 @@ impl Workspace {
         if let Err(e) = self.profile.validate() {
             self.note(e);
         } else if let Some(path) = self.path.clone() {
+            if self.smoke.is_none() {
+                if self.profile.bind_dn.is_empty() {
+                    self.profile.password_saved = false;
+                } else {
+                    match crate::profiles::probe_saved_password(&self.profile) {
+                        crate::profiles::SavedCredentialState::Present
+                        | crate::profiles::SavedCredentialState::LockedOrDenied(_) => {
+                            self.profile.password_saved = true;
+                        }
+                        crate::profiles::SavedCredentialState::Missing => {
+                            self.profile.password_saved = false;
+                        }
+                        crate::profiles::SavedCredentialState::StoreUnavailable(_) => {}
+                    }
+                }
+            }
             let mut profiles = self.profiles.clone();
             profiles.retain(|p| p.id != self.profile.id);
             profiles.push(self.profile.clone());
-            self.send(Request::SaveProfiles(path, profiles.clone()));
+            self.send(Request::SaveProfiles(
+                path,
+                profiles.clone(),
+                theme_name(self.appearance),
+            ));
             self.profiles = profiles;
         } else {
             self.note("Profile file unavailable; original data is preserved".into());
         }
     }
+    fn forget_password(&mut self) {
+        if self.busy {
+            return;
+        }
+        let target = self.credential_target_profile();
+        let mut profiles = self.profiles.clone();
+        for p in &mut profiles {
+            if p.id == target.id {
+                p.password_saved = false;
+            }
+        }
+        let save = self
+            .path
+            .clone()
+            .map(|path| (path, profiles, theme_name(self.appearance)));
+        self.send(Request::ForgetPassword(target, save));
+    }
+    fn delete_profile(&mut self, remove_credential: bool) {
+        if self.connected || self.busy {
+            return;
+        }
+        let target = self.credential_target_profile();
+        let mut profiles = self.profiles.clone();
+        profiles.retain(|p| p.id != target.id);
+        let save = self
+            .path
+            .clone()
+            .map(|path| (path, profiles, theme_name(self.appearance)));
+        self.send(Request::DeleteProfile {
+            profile: target,
+            remove_credential: remove_credential && self.credential_storage.is_ok(),
+            save,
+        });
+    }
+    fn has_unsaved_profile_edits(&self) -> bool {
+        match self.profiles.iter().find(|p| p.id == self.profile.id) {
+            Some(saved) => saved != &self.profile,
+            None => {
+                self.profile
+                    != Profile {
+                        id: self.profile.id,
+                        ..Profile::default()
+                    }
+            }
+        }
+    }
     fn connection_fields(&mut self, ui: &mut egui::Ui) {
-        ui.add_enabled_ui(!self.connected && !self.busy, |ui| {
+        // Enter in a connection field submits, like a login form. Profile name is excluded.
+        let mut submit = false;
+        let mut forget = false;
+        let prev_endpoint = self.profile.endpoint.clone();
+        let prev_bind_dn = self.profile.bind_dn.clone();
+        ui.add_enabled_ui(!self.busy, |ui| {
             field(ui, "Profile name", &mut self.profile.name);
-            field(ui, "LDAPS endpoint", &mut self.profile.endpoint);
-            field(
+        });
+        let target = self.credential_target_profile();
+        let has_saved_password = (!target.bind_dn.is_empty() && target.password_saved)
+            || (!self.profile.bind_dn.is_empty() && self.profile.password_saved);
+        ui.add_enabled_ui(!self.connected && !self.busy, |ui| {
+            let mut fields = vec![field_response(
+                ui,
+                "LDAPS endpoint",
+                &mut self.profile.endpoint,
+            )];
+            fields.push(field_response(
                 ui,
                 "Base DN (blank discovers roots)",
                 &mut self.profile.base_dn,
-            );
-            field(ui, "Bind DN (blank = anonymous)", &mut self.profile.bind_dn);
+            ));
+            fields.push(field_response(
+                ui,
+                "Bind DN (blank = anonymous)",
+                &mut self.profile.bind_dn,
+            ));
+            if (self.profile.endpoint != prev_endpoint || self.profile.bind_dn != prev_bind_dn)
+                && self.profile.bind_dn.is_empty()
+            {
+                self.remember = false;
+            }
+            let form_uses_saved_password = !self.profile.bind_dn.is_empty()
+                && ((target.password_saved
+                    && self.profile.endpoint == target.endpoint
+                    && self.profile.bind_dn == target.bind_dn)
+                    || (self.saved_profile().is_none() && self.profile.password_saved));
+            let password_label = if form_uses_saved_password {
+                "Password (saved password will be used)"
+            } else {
+                "Password (blank uses saved credential)"
+            };
             let label = ui.label(
-                egui::RichText::new("Password (blank uses saved credential)")
+                egui::RichText::new(password_label)
                     .small()
                     .color(theme::colors(ui).muted),
             );
-            ui.add(
-                egui::TextEdit::singleline(&mut *self.password)
-                    .password(true)
-                    .desired_width(f32::INFINITY),
-            )
-            .labelled_by(label.id);
+            fields.push(
+                ui.add(
+                    egui::TextEdit::singleline(&mut *self.password)
+                        .id(egui::Id::unique("connection-password"))
+                        .password(true)
+                        .hint_text(if form_uses_saved_password {
+                            "Saved password will be used"
+                        } else {
+                            ""
+                        })
+                        .desired_width(f32::INFINITY),
+                )
+                .labelled_by(label.id),
+            );
+            submit = fields.iter().any(|response| {
+                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+            });
             ui.add_enabled_ui(self.credential_storage.is_ok(), |ui| {
                 ui.checkbox(&mut self.remember, "Save password in OS keychain");
             });
+        });
+        ui.horizontal_wrapped(|ui| {
+            if has_saved_password {
+                let indicator = if self.credential_locked_notice.is_some() {
+                    "🔒 Password saved in keychain (unavailable: locked or access denied)"
+                } else {
+                    "🔒 Password saved in keychain"
+                };
+                ui.label(
+                    egui::RichText::new(indicator)
+                        .small()
+                        .color(theme::colors(ui).accent)
+                        .strong(),
+                );
+                if ui
+                    .add_enabled(
+                        !self.busy && self.credential_storage.is_ok(),
+                        egui::Button::new("Forget saved password"),
+                    )
+                    .clicked()
+                {
+                    forget = true;
+                }
+            } else {
+                ui.label(
+                    egui::RichText::new("No saved password")
+                        .small()
+                        .color(theme::colors(ui).muted),
+                );
+            }
+        });
+        ui.add_enabled_ui(!self.connected && !self.busy, |ui| {
             if let Err(message) = &self.credential_storage {
                 ui.scope(|ui| {
                     theme::note(
@@ -482,7 +860,12 @@ impl Workspace {
                 .on_hover_text(message);
             }
             ui.collapsing("TLS trust · extra CA bundle", |ui| {
-                field(ui, "Extra CA bundle PEM path", &mut self.profile.ca_bundle);
+                field_with_hint(
+                    ui,
+                    "Extra CA bundle PEM path",
+                    "Full path or ~/… (for example ~/certs/ca.pem)",
+                    &mut self.profile.ca_bundle,
+                );
             });
             ui.label(
                 egui::RichText::new("System roots + selected CA. TLS verification is mandatory.")
@@ -490,6 +873,11 @@ impl Workspace {
                     .color(theme::colors(ui).muted),
             );
         });
+        if forget {
+            self.forget_password();
+        } else if submit {
+            self.connect();
+        }
     }
     fn profile_form(&mut self, ui: &mut egui::Ui) {
         let compact = ui.ctx().content_rect().height() < 600.0;
@@ -523,9 +911,7 @@ impl Workspace {
             });
         });
         if let Some(p) = choice {
-            self.profile = p;
-            self.password = Zeroizing::new(String::new());
-            self.base = self.profile.base_dn.clone();
+            self.select_profile(p);
         }
         if self.connected {
             if compact {
@@ -572,20 +958,46 @@ impl Workspace {
                     self.disconnect();
                 }
             }
-            ui.collapsing("Connection settings", |ui| {
+            let settings = ui.collapsing("Connection settings", |ui| {
                 ui.small("Disconnect before changing server or identity.");
                 egui::ScrollArea::vertical()
                     .id_salt("connection-settings")
                     .max_height(210.0)
                     .show(ui, |ui| self.connection_fields(ui));
+                if self.has_unsaved_profile_edits() {
+                    ui.small("Unsaved profile edits — click Save profile to keep changes across restarts.");
+                }
+                if ui
+                    .add_enabled(!self.busy, egui::Button::new("Save profile"))
+                    .clicked()
+                {
+                    self.save_profile();
+                }
             });
+            if settings.body_returned.is_none() {
+                if self.has_unsaved_profile_edits() {
+                    ui.small("Unsaved profile edits — click Save profile to keep changes across restarts.");
+                }
+                if ui
+                    .add_enabled(!self.busy, egui::Button::new("Save profile"))
+                    .clicked()
+                {
+                    self.save_profile();
+                }
+            }
         } else {
             egui::ScrollArea::vertical()
                 .id_salt("connection-fields")
                 .max_height((ui.available_height() - 185.0).max(100.0))
                 .show(ui, |ui| self.connection_fields(ui));
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
+            if self.has_unsaved_profile_edits() {
+                ui.small(
+                    "Unsaved profile edits — click Save profile to keep changes across restarts.",
+                );
+            }
+            let is_saved_profile = self.profiles.iter().any(|p| p.id == self.profile.id);
+            ui.horizontal_wrapped(|ui| {
                 let connect = theme::primary(ui, "Connect", !self.busy);
                 self.connection_screen_visible &= ui.is_rect_visible(connect.rect);
                 if connect.clicked() {
@@ -597,7 +1009,35 @@ impl Workspace {
                 {
                     self.save_profile();
                 }
+                if is_saved_profile
+                    && ui
+                        .add_enabled(!self.busy, egui::Button::new("Delete profile"))
+                        .clicked()
+                {
+                    self.confirm_delete_profile = true;
+                    self.delete_profile_credential = true;
+                }
             });
+            if self.confirm_delete_profile && is_saved_profile {
+                ui.add_space(4.0);
+                let has_target_bind_dn = !self.credential_target_profile().bind_dn.is_empty();
+                ui.add_enabled_ui(!self.busy, |ui| {
+                    if has_target_bind_dn && self.credential_storage.is_ok() {
+                        ui.checkbox(
+                            &mut self.delete_profile_credential,
+                            "Also remove saved password from OS keychain",
+                        );
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Confirm delete profile").clicked() {
+                            self.delete_profile(self.delete_profile_credential);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_delete_profile = false;
+                        }
+                    });
+                });
+            }
         }
         ui.add_space(8.0);
         ui.separator();
@@ -883,7 +1323,7 @@ impl Workspace {
                                 ui.small(format!("{} {}", values.len(), if values.len() == 1 {"value"} else {"values"}));
                             });
                             ui.vertical(|ui| {
-                                ui.set_max_width(value_width);
+                                ui.set_width(value_width);
                                 for (index, value) in values.iter().enumerate() {
                                     if !credential_attribute(name) && crate::certificates::kind(name).is_some() {
                                         ui.push_id((name,index), |ui| {
@@ -997,8 +1437,64 @@ impl Workspace {
                 }
             });
     }
+    fn filter_is_unmodified_or_generated(&self) -> bool {
+        self.filter.trim().is_empty()
+            || self.filter == "(objectClass=*)"
+            || (!self.last_quick_filter.is_empty() && self.filter == self.last_quick_filter)
+    }
+    fn sync_quick_search_filter(&mut self) {
+        if self.filter_is_unmodified_or_generated()
+            && let Ok(filter) = smart_filter(&self.quick_search)
+        {
+            self.last_quick_filter = filter.clone();
+            self.filter = filter;
+        }
+    }
+    fn apply_quick_search_filter(&mut self) -> bool {
+        match smart_filter(&self.quick_search) {
+            Ok(filter) => {
+                self.last_quick_filter = filter.clone();
+                self.filter = filter;
+                true
+            }
+            Err(message) => {
+                self.note(message);
+                false
+            }
+        }
+    }
     fn run_search(&mut self) {
         if !self.connected || self.busy {
+            return;
+        }
+        if !self.quick_search.trim().is_empty() && self.filter_is_unmodified_or_generated() {
+            match smart_filter(&self.quick_search) {
+                Ok(filter) => {
+                    self.last_quick_filter = filter.clone();
+                    self.filter = filter;
+                }
+                Err(message) => {
+                    self.note(message);
+                    return;
+                }
+            }
+        }
+        if self.base.trim().is_empty() {
+            if let Some(selected) = &self.selected
+                && !selected.dn.is_empty()
+            {
+                self.base = selected.dn.clone();
+            } else if let Some(first) = self.roots.first()
+                && !first.is_empty()
+            {
+                self.base = first.clone();
+            }
+        }
+        if self.base.trim().is_empty() {
+            self.note(
+                "Cannot run search: choose a search base DN first (for example a naming context from the directory tree)"
+                    .into(),
+            );
             return;
         }
         let query = Query {
@@ -1019,28 +1515,37 @@ impl Workspace {
     }
     fn search_controls(&mut self, ui: &mut egui::Ui, run: bool) {
         ui.horizontal_wrapped(|ui| {
-            ui.label("Quick search · uid / cn / mail");
+            ui.label("Quick search · plain text (uid/cn/mail) or (LDAP filter)");
             let input = ui.add(
                 egui::TextEdit::singleline(&mut self.quick_search)
-                    .hint_text("Name, uid, email or LDAP filter")
+                    .hint_text("Plain text (alice) or (uid=alice*)")
                     .desired_width(260.0),
             );
-            if ui.button("Use smart filter").clicked()
-                || input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+            if input.changed() {
+                self.sync_quick_search_filter();
+            }
+            let enter_pressed = input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (ui.button("Use smart filter").clicked() || enter_pressed)
+                && self.apply_quick_search_filter()
+                && enter_pressed
+                && self.connected
+                && !self.busy
             {
-                match smart_filter(&self.quick_search) {
-                    Ok(filter) => self.filter = filter,
-                    Err(message) => self.note(message),
-                }
+                self.run_search();
             }
         });
         if ui.available_width() > 640.0 {
             ui.columns(2, |columns| {
-                field(&mut columns[0], "Search base DN", &mut self.base);
+                field_with_hint(
+                    &mut columns[0],
+                    "Search base DN",
+                    "dc=example,dc=org",
+                    &mut self.base,
+                );
                 field(&mut columns[1], "LDAP filter", &mut self.filter);
             });
         } else {
-            field(ui, "Search base DN", &mut self.base);
+            field_with_hint(ui, "Search base DN", "dc=example,dc=org", &mut self.base);
             field(ui, "LDAP filter", &mut self.filter);
         }
         ui.collapsing(
@@ -1113,12 +1618,17 @@ impl Workspace {
         let vlv = cached.is_some_and(|q| q.mode == Mode::Vlv);
         if let Some(q) = cached {
             ui.label(format!(
-                "{} · {} cached rows{}",
+                "{} · {} cached rows{}{}",
                 page_mode(q.mode),
                 self.pages.entries(&Key::Search).len(),
                 q.total
                     .map(|n| format!(" · server VLV count {n}"))
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                if q.next.is_none() && q.warning.is_none() {
+                    " · all results loaded"
+                } else {
+                    ""
+                }
             ));
             if q.evicted {
                 ui.label("Earlier pages evicted to keep memory bounded. Use VLV position or restart a forward-only query to revisit them.");
@@ -1302,6 +1812,97 @@ impl Workspace {
     fn export_entries(&self, entries: &[Entry]) -> String {
         ldif::export_with_credentials(entries, self.include_credentials)
     }
+    fn load_ldif_file(&mut self) {
+        let path = match crate::model::expand_local_path(&self.file) {
+            Ok(path) => path,
+            Err(message) => {
+                self.note(message);
+                return;
+            }
+        };
+        let meta = match std::fs::metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.note(
+                    "Cannot read LDIF file: file not found; check the path (for example ~/Downloads/entries.ldif)"
+                        .into(),
+                );
+                return;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                self.note("Cannot read LDIF file: permission denied".into());
+                return;
+            }
+            Err(_) => {
+                self.note("Cannot read LDIF file; check the file path and permissions".into());
+                return;
+            }
+        };
+        if meta.is_dir() {
+            self.note("Cannot read LDIF file: path is a directory, not a file".into());
+            return;
+        }
+        if meta.len() > 16 * 1024 * 1024 {
+            self.note("Cannot read LDIF file: file exceeds the 16 MiB maximum".into());
+            return;
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(s) => {
+                self.transfer = s;
+                self.pending.clear();
+                self.preview = false;
+                self.note("LDIF file loaded into draft".into());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                self.note("Cannot read LDIF file: file is not valid UTF-8".into());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                self.note("Cannot read LDIF file: permission denied".into());
+            }
+            Err(_) => self.note("Cannot read LDIF file (UTF-8, maximum 16 MiB)".into()),
+        }
+    }
+    fn save_ldif_file(&mut self) {
+        use std::io::Write;
+        let path = match crate::model::expand_local_path(&self.file) {
+            Ok(path) => path,
+            Err(message) => {
+                self.note(message);
+                return;
+            }
+        };
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options
+            .open(&path)
+            .and_then(|mut f| f.write_all(self.transfer.as_bytes()))
+        {
+            Ok(()) => self.note("LDIF saved to new file".into()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.note(
+                    "Cannot create file: file already exists (existing files are never overwritten)"
+                        .into(),
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.note(
+                    "Cannot create file: parent folder does not exist; check the file path".into(),
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                self.note("Cannot create file: permission denied (folder is not writable)".into());
+            }
+            Err(_) => self.note(
+                "Cannot create file; enter a full file path in a writable folder (existing files are never overwritten)"
+                    .into(),
+            ),
+        }
+    }
     fn transfer_view(&mut self, ui: &mut egui::Ui) {
         ui.heading("LDIF transfer");
         ui.label("Search export includes only currently cached rows; unfetched or evicted pages are excluded.");
@@ -1321,23 +1922,15 @@ impl Workspace {
                 true,
             );
         }
-        field(ui, "Local LDIF file path", &mut self.file);
+        field_with_hint(
+            ui,
+            "Local LDIF file path",
+            "Full path or ~/… (for example ~/Downloads/export.ldif)",
+            &mut self.file,
+        );
         ui.horizontal(|ui| {
             if ui.button("Load file").clicked() {
-                match std::fs::metadata(&self.file).and_then(|m| {
-                    if m.len() <= 16 * 1024 * 1024 {
-                        std::fs::read_to_string(&self.file)
-                    } else {
-                        Err(std::io::Error::other("too large"))
-                    }
-                }) {
-                    Ok(s) => {
-                        self.transfer = s;
-                        self.pending.clear();
-                        self.preview = false;
-                    }
-                    Err(_) => self.note("Cannot read LDIF file (UTF-8, maximum 16 MiB)".into()),
-                }
+                self.load_ldif_file();
             }
             if ui.button("Export selected entry into draft").clicked()
                 && let Some(e) = &self.selected
@@ -1363,22 +1956,7 @@ impl Workspace {
         );
         ui.horizontal(|ui| {
             if ui.button("Save draft as new file").clicked() {
-                use std::io::Write;
-                let mut options = std::fs::OpenOptions::new();
-                options.write(true).create_new(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.mode(0o600);
-                }
-                match options
-                    .open(&self.file)
-                    .and_then(|mut f| f.write_all(self.transfer.as_bytes()))
-                {
-                    Ok(()) => self.note("LDIF saved to new file".into()),
-                    Err(_) => self
-                        .note("Cannot create file (existing files are never overwritten)".into()),
-                }
+                self.save_ldif_file();
             }
             if ui.button("Preview import").clicked() {
                 self.stage_import();
@@ -1584,6 +2162,28 @@ fn tree_rows(roots: &[String], cache: &PageCache) -> Vec<TreeRow> {
     rows
 }
 fn field(ui: &mut egui::Ui, label: &str, value: &mut String) {
+    field_response(ui, label, value);
+}
+fn field_with_hint(ui: &mut egui::Ui, label: &str, hint: &str, value: &mut String) {
+    let label_response = ui.label(
+        egui::RichText::new(label)
+            .small()
+            .color(theme::colors(ui).muted),
+    );
+    let id = match label {
+        "LDAP filter" => egui::Id::unique("query-filter"),
+        "LDAPS endpoint" => egui::Id::unique("connection-endpoint"),
+        _ => ui.make_persistent_id(("field", label)),
+    };
+    ui.add(
+        egui::TextEdit::singleline(value)
+            .id(id)
+            .hint_text(hint)
+            .desired_width(f32::INFINITY),
+    )
+    .labelled_by(label_response.id);
+}
+fn field_response(ui: &mut egui::Ui, label: &str, value: &mut String) -> egui::Response {
     let label_response = ui.label(
         egui::RichText::new(label)
             .small()
@@ -1599,7 +2199,7 @@ fn field(ui: &mut egui::Ui, label: &str, value: &mut String) {
             .id(id)
             .desired_width(f32::INFINITY),
     )
-    .labelled_by(label_response.id);
+    .labelled_by(label_response.id)
 }
 fn rdn_label(dn: &str) -> &str {
     let mut escaped = false;
@@ -1641,6 +2241,13 @@ fn status_color(ui: &egui::Ui, message: &str) -> egui::Color32 {
         "denied",
         "could not",
         "error",
+        "not found",
+        "timed out",
+        "refused",
+        "mismatch",
+        "expired",
+        "not trusted",
+        "omitted",
     ]
     .iter()
     .any(|word| lower.contains(word))
@@ -1653,6 +2260,13 @@ fn status_color(ui: &egui::Ui, message: &str) -> egui::Color32 {
 fn display(bytes: &[u8]) -> String {
     String::from_utf8(bytes.to_vec())
         .unwrap_or_else(|_| format!("base64: {}", STANDARD.encode(bytes)))
+}
+fn theme_name(preference: egui::ThemePreference) -> Option<String> {
+    match preference {
+        egui::ThemePreference::Dark => Some("dark".into()),
+        egui::ThemePreference::Light => Some("light".into()),
+        egui::ThemePreference::System => None,
+    }
 }
 impl Workspace {
     fn shortcuts(&mut self, ctx: &egui::Context) {
@@ -1753,6 +2367,13 @@ impl Workspace {
                             });
                         if previous != self.appearance {
                             ctx.set_theme(self.appearance);
+                            if let Some(path) = &self.path {
+                                let _ = crate::profiles::save_with_theme(
+                                    path,
+                                    &self.profiles,
+                                    theme_name(self.appearance).as_deref(),
+                                );
+                            }
                         }
                         ui.menu_button("Shortcuts", |ui| {
                             for line in [
@@ -1802,12 +2423,22 @@ impl Workspace {
                     }
                 });
                 ui.collapsing("Operation log", |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!self.logs.is_empty(), egui::Button::new("Copy log"))
+                            .clicked()
+                        {
+                            let joined: Vec<&str> = self.logs.iter().map(String::as_str).collect();
+                            ui.ctx().copy_text(joined.join("\n"));
+                        }
+                        ui.small(format!("{} entries", self.logs.len()));
+                    });
                     egui::ScrollArea::vertical()
                         .id_salt("operation-log")
                         .max_height(100.0)
                         .show(ui, |ui| {
                             for line in self.logs.iter().rev() {
-                                ui.label(line);
+                                ui.add(egui::Label::new(line).selectable(true));
                             }
                         });
                 });
@@ -1900,6 +2531,8 @@ impl eframe::App for Workspace {
     }
 }
 
+const DEFAULT_ATTRIBUTES_HEIGHT: f32 = 360.0;
+
 // Keep both panes usable on short viewports. Desired size survives entry changes.
 fn split_height(desired: f32, available: f32) -> f32 {
     let min = 100.0_f32.min((available * 0.4).max(24.0));
@@ -1944,7 +2577,7 @@ fn attributes_splitter(ui: &mut egui::Ui, desired: &mut f32, available: f32) -> 
         *desired = split_height(*desired, available);
     }
     if response.double_clicked() {
-        *desired = 260.0;
+        *desired = DEFAULT_ATTRIBUTES_HEIGHT;
     }
     if response.hovered() || response.dragged() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
@@ -2103,7 +2736,7 @@ mod tests {
             );
             frame(vec![pointer(pos, false)], false, &mut height);
         }
-        assert_eq!(height, 260.0);
+        assert_eq!(height, DEFAULT_ATTRIBUTES_HEIGHT);
         for available in [80.0, 150.0, 400.0, 900.0] {
             let h = split_height(10000.0, available);
             assert!(h.is_finite() && h > 0.0 && h < available);
@@ -2208,6 +2841,87 @@ mod tests {
             |_ui| w.shortcuts(ctx),
         );
         output.textures_delta.clear();
+    }
+    fn connection_frame(ctx: &egui::Context, w: &mut Workspace, events: Vec<egui::Event>) {
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 700.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| w.connection_fields(ui));
+            },
+        );
+        out.textures_delta.clear();
+    }
+    fn enter() -> Vec<egui::Event> {
+        [true, false]
+            .into_iter()
+            .map(|pressed| egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            })
+            .collect()
+    }
+    #[test]
+    fn enter_in_the_password_field_connects_but_enter_elsewhere_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let mut w = Workspace::from_path(
+            ctx.clone(),
+            Some(dir.path().join("profiles.json")),
+            None,
+            false,
+        );
+        w.profile.endpoint = "ldaps://localhost:636".into();
+        w.profile.bind_dn = "uid=test,dc=example".into();
+        connection_frame(&ctx, &mut w, vec![]);
+        // No field focused: Enter must not connect.
+        let before = w.generation;
+        connection_frame(&ctx, &mut w, enter());
+        assert_eq!(w.generation, before, "Enter with nothing focused connected");
+        // Focus the password field, paste, press Enter.
+        ctx.memory_mut(|m| m.request_focus(egui::Id::unique("connection-password")));
+        connection_frame(&ctx, &mut w, vec![]);
+        connection_frame(
+            &ctx,
+            &mut w,
+            vec![egui::Event::Paste("synthetic-secret".into())],
+        );
+        assert_eq!(&*w.password, "synthetic-secret");
+        connection_frame(&ctx, &mut w, enter());
+        assert_eq!(
+            w.generation,
+            before + 1,
+            "Enter in the password field did not connect"
+        );
+        assert!(w.busy);
+        // Pressing Enter again while busy must not double-submit.
+        ctx.memory_mut(|m| m.request_focus(egui::Id::unique("connection-password")));
+        connection_frame(&ctx, &mut w, vec![]);
+        connection_frame(&ctx, &mut w, enter());
+        assert_eq!(
+            w.generation,
+            before + 1,
+            "Enter while busy double-submitted"
+        );
+        // Enter in the endpoint field also connects when idle.
+        w.busy = false;
+        ctx.memory_mut(|m| m.request_focus(egui::Id::unique("connection-endpoint")));
+        connection_frame(&ctx, &mut w, vec![]);
+        connection_frame(&ctx, &mut w, enter());
+        assert_eq!(
+            w.generation,
+            before + 2,
+            "Enter in the endpoint field did not connect"
+        );
     }
     #[test]
     fn keyboard_navigation_never_applies_a_pending_write() {
@@ -2620,5 +3334,506 @@ mod tests {
                 .contains("Continuation closed")
         );
         assert_eq!(w.pages.entries(&Key::Search).len(), 500);
+    }
+    fn wait_for_worker(w: &mut Workspace) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while w.busy && std::time::Instant::now() < deadline {
+            w.poll();
+            if w.busy {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        assert!(!w.busy, "worker did not complete in time");
+    }
+    #[test]
+    fn saved_password_indicator_forget_delete_and_connected_save_profile() {
+        crate::profiles::credential_status().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let profile = Profile {
+            name: "myldap".into(),
+            endpoint: "ldaps://directory.example.org:636".into(),
+            base_dn: "dc=example,dc=org".into(),
+            bind_dn: "uid=alice,dc=example,dc=org".into(),
+            ca_bundle: String::new(),
+            password_saved: true,
+            ..Profile::default()
+        };
+        crate::profiles::credential(&profile)
+            .unwrap()
+            .set_password("synthetic-keychain-secret")
+            .unwrap();
+        crate::profiles::save_with_theme(&path, std::slice::from_ref(&profile), Some("dark"))
+            .unwrap();
+        let ctx = egui::Context::default();
+        let mut w = Workspace::from_path(ctx.clone(), Some(path.clone()), None, false);
+        assert_eq!(w.appearance, egui::ThemePreference::Dark);
+        assert!(w.profile.password_saved);
+        assert!(w.remember);
+        // Render profile_form when disconnected: saved-password indicator and Forget button must render.
+        let mut painted = String::new();
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 700.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| w.profile_form(ui));
+                },
+            );
+            painted.clear();
+            for s in &out.shapes {
+                rendered_text(&s.shape, &mut painted);
+            }
+            out.textures_delta.clear();
+        }
+        assert!(painted.contains("Password saved in keychain"));
+        assert!(painted.contains("Forget saved password"));
+        assert!(painted.contains("Password (saved password will be used)"));
+        assert!(painted.contains("Delete profile"));
+        // While connected, Save profile remains visible even when Connection settings is collapsed.
+        w.connected = true;
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 700.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| w.profile_form(ui));
+                },
+            );
+            painted.clear();
+            for s in &out.shapes {
+                rendered_text(&s.shape, &mut painted);
+            }
+            out.textures_delta.clear();
+        }
+        assert!(
+            painted.contains("Save profile"),
+            "Save profile must remain visible while connected"
+        );
+        w.connected = false;
+        // Forget saved password deletes the keychain entry and clears password_saved on disk.
+        w.forget_password();
+        wait_for_worker(&mut w);
+        assert!(!w.profile.password_saved);
+        assert!(!w.remember);
+        assert_eq!(w.status, "Saved password removed from OS keychain");
+        assert!(
+            crate::profiles::saved_password(&w.profile)
+                .unwrap_err()
+                .contains("No saved password available")
+        );
+        assert!(!crate::profiles::load(&path).unwrap()[0].password_saved);
+        // Re-save a keychain password and test Delete profile with keychain removal.
+        crate::profiles::credential(&w.profile)
+            .unwrap()
+            .set_password("second-secret")
+            .unwrap();
+        w.profile.password_saved = true;
+        w.delete_profile(true);
+        wait_for_worker(&mut w);
+        assert!(w.profiles.is_empty());
+        assert!(crate::profiles::load(&path).unwrap().is_empty());
+        assert!(crate::profiles::saved_password(&profile).is_err());
+    }
+    #[test]
+    fn existing_keychain_entry_without_flag_sets_saved_indicator_on_load_and_connect() {
+        crate::profiles::credential_status().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        // Profile on disk has password_saved = false (simulating pre-alpha.3 profiles.json),
+        // while the OS keychain already holds a password for this profile.
+        let profile = Profile {
+            name: "existing-keychain".into(),
+            endpoint: "ldaps://directory.example.org:636".into(),
+            base_dn: "dc=example,dc=org".into(),
+            bind_dn: "uid=alice,dc=example,dc=org".into(),
+            ca_bundle: String::new(),
+            password_saved: false,
+            ..Profile::default()
+        };
+        let entry = crate::profiles::credential(&profile).unwrap();
+        entry.set_password("existing-secret").unwrap();
+        crate::profiles::save(&path, std::slice::from_ref(&profile)).unwrap();
+
+        let ctx = egui::Context::default();
+        let mut w = Workspace::from_path(ctx.clone(), Some(path.clone()), None, false);
+        assert!(
+            w.profile.password_saved,
+            "existing keychain entry must set password_saved on profile load"
+        );
+        assert!(w.remember);
+        assert!(crate::profiles::load(&path).unwrap()[0].password_saved);
+
+        let mut painted = String::new();
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 700.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| w.profile_form(ui));
+                },
+            );
+            painted.clear();
+            for s in &out.shapes {
+                rendered_text(&s.shape, &mut painted);
+            }
+            out.textures_delta.clear();
+        }
+        assert!(painted.contains("Password saved in keychain"));
+        assert!(painted.contains("Forget saved password"));
+
+        // Also verify blank-password connect when password_saved and remember start false in memory.
+        w.profile.password_saved = false;
+        w.profiles[0].password_saved = false;
+        w.remember = false;
+        w.password.clear();
+        w.connecting_saves_or_uses_keychain =
+            !w.profile.bind_dn.is_empty() && (w.remember || w.password.is_empty());
+        w.busy = true;
+        w.accept_response(0, Response::Connected(vec!["dc=example,dc=org".into()]));
+        assert!(w.profile.password_saved);
+        assert!(w.remember);
+        assert!(crate::profiles::load(&path).unwrap()[0].password_saved);
+
+        // Locked/denied keychain entry on load reports saved but unavailable with a clear message.
+        let mock: &keyring::mock::Cred = entry.as_any().downcast_ref().unwrap();
+        mock.set_error(keyring::Error::NoStorageAccess(Box::new(
+            std::io::Error::other("keychain locked"),
+        )));
+        let mut locked_profile = profile.clone();
+        locked_profile.password_saved = false;
+        crate::profiles::save(&path, std::slice::from_ref(&locked_profile)).unwrap();
+        let mut w_locked = Workspace::from_path(ctx.clone(), Some(path.clone()), None, false);
+        assert!(w_locked.profile.password_saved);
+        assert!(w_locked.status.contains("locked or access was denied"));
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 700.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| w_locked.profile_form(ui));
+                },
+            );
+            painted.clear();
+            for s in &out.shapes {
+                rendered_text(&s.shape, &mut painted);
+            }
+            out.textures_delta.clear();
+        }
+        assert!(
+            painted.contains("Password saved in keychain (unavailable: locked or access denied)")
+        );
+        assert!(painted.contains("Forget saved password"));
+        let _ = crate::profiles::delete_saved_password(&profile);
+    }
+    #[test]
+    fn edited_endpoint_or_bind_dn_still_forgets_and_deletes_saved_profile_credential() {
+        crate::profiles::credential_status().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let saved = Profile {
+            name: "prod".into(),
+            endpoint: "ldaps://prod.example.org:636".into(),
+            base_dn: "dc=example,dc=org".into(),
+            bind_dn: "uid=alice,dc=example,dc=org".into(),
+            ca_bundle: String::new(),
+            password_saved: true,
+            ..Profile::default()
+        };
+        crate::profiles::credential(&saved)
+            .unwrap()
+            .set_password("prod-secret")
+            .unwrap();
+        crate::profiles::save(&path, std::slice::from_ref(&saved)).unwrap();
+
+        let ctx = egui::Context::default();
+        let mut w = Workspace::from_path(ctx.clone(), Some(path.clone()), None, false);
+        // Edit endpoint and bind_dn in the form WITHOUT clicking Save profile.
+        w.profile.endpoint = "ldaps://edited.example.org:636".into();
+        w.profile.bind_dn = "uid=bob,dc=example,dc=org".into();
+        let edited_copy = w.profile.clone();
+        crate::profiles::credential(&edited_copy)
+            .unwrap()
+            .set_password("other-secret")
+            .unwrap();
+
+        // Forget must still remain visible in the UI and target the SAVED profile's key.
+        let mut painted = String::new();
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 700.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| w.profile_form(ui));
+                },
+            );
+            painted.clear();
+            for s in &out.shapes {
+                rendered_text(&s.shape, &mut painted);
+            }
+            out.textures_delta.clear();
+        }
+        assert!(painted.contains("Forget saved password"));
+
+        w.forget_password();
+        wait_for_worker(&mut w);
+        assert_eq!(w.status, "Saved password removed from OS keychain");
+        // A later blank-password connect on the original saved profile must NOT still find prod-secret.
+        let mut unflagged_saved = saved.clone();
+        unflagged_saved.password_saved = false;
+        assert_eq!(
+            crate::profiles::saved_password(&unflagged_saved).unwrap_err(),
+            "No saved password available; enter one to connect"
+        );
+        // Unrelated credential under edited_copy was not touched.
+        assert_eq!(
+            crate::profiles::saved_password(&edited_copy).unwrap(),
+            "other-secret"
+        );
+        // Forgetting again when the entry is already absent reports "Nothing to forget".
+        w.forget_password();
+        wait_for_worker(&mut w);
+        assert!(w.status.contains("Nothing to forget"));
+
+        // Re-save prod-secret on the saved profile, keep edited form values, and test Delete profile.
+        crate::profiles::credential(&saved)
+            .unwrap()
+            .set_password("prod-secret-2")
+            .unwrap();
+        w.profiles[0].password_saved = true;
+        w.delete_profile(true);
+        wait_for_worker(&mut w);
+        assert!(w.profiles.is_empty());
+        assert!(crate::profiles::saved_password(&unflagged_saved).is_err());
+        let _ = crate::profiles::delete_saved_password(&edited_copy);
+    }
+    #[test]
+    fn keychain_delete_failure_surfaces_error_and_preserves_saved_state() {
+        crate::profiles::credential_status().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let saved = Profile {
+            name: "locked-delete".into(),
+            endpoint: "ldaps://locked.example.org:636".into(),
+            base_dn: "dc=example,dc=org".into(),
+            bind_dn: "uid=alice,dc=example,dc=org".into(),
+            ca_bundle: String::new(),
+            password_saved: true,
+            ..Profile::default()
+        };
+        let entry = crate::profiles::credential(&saved).unwrap();
+        entry.set_password("cannot-delete-yet").unwrap();
+        crate::profiles::save(&path, std::slice::from_ref(&saved)).unwrap();
+
+        let ctx = egui::Context::default();
+        let mut w = Workspace::from_path(ctx, Some(path.clone()), None, false);
+
+        // Inject a failure on delete_credential during Forget password.
+        let mock: &keyring::mock::Cred = entry.as_any().downcast_ref().unwrap();
+        mock.set_error(keyring::Error::NoStorageAccess(Box::new(
+            std::io::Error::other("keychain locked"),
+        )));
+        w.forget_password();
+        wait_for_worker(&mut w);
+        assert!(
+            w.status
+                .contains("Could not remove the saved password from the OS keychain"),
+            "status was: {}",
+            w.status
+        );
+        assert!(w.profile.password_saved);
+        assert!(w.profiles[0].password_saved);
+        assert!(crate::profiles::load(&path).unwrap()[0].password_saved);
+
+        // Inject a failure on delete_credential during Delete profile.
+        mock.set_error(keyring::Error::NoStorageAccess(Box::new(
+            std::io::Error::other("keychain locked"),
+        )));
+        w.delete_profile(true);
+        wait_for_worker(&mut w);
+        assert!(
+            w.status
+                .contains("Could not remove the saved password from the OS keychain")
+        );
+        assert_eq!(w.profiles.len(), 1);
+        assert_eq!(crate::profiles::load(&path).unwrap().len(), 1);
+
+        // Once the error clears, Forget succeeds and removes the secret.
+        w.forget_password();
+        wait_for_worker(&mut w);
+        assert!(!w.profile.password_saved);
+        assert!(crate::profiles::saved_password(&saved).is_err());
+    }
+    #[test]
+    fn search_defaults_base_dn_applies_quick_search_and_reports_end_of_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = workspace(dir.path().join("profiles.json"));
+        assert_eq!(w.scope, 2, "search scope must default to Subtree");
+        // Connected with no discovered roots and empty base DN: run_search refuses cleanly without dispatching.
+        w.accept_response(w.generation, Response::Connected(vec![]));
+        assert!(w.base.is_empty());
+        w.run_search();
+        assert!(!w.busy);
+        assert!(w.status.contains("choose a search base DN"));
+        // Connected with a discovered naming context populates base DN automatically when blank.
+        w.accept_response(
+            w.generation,
+            Response::Connected(vec!["dc=example,dc=org".into()]),
+        );
+        assert_eq!(w.base, "dc=example,dc=org");
+        // Typing in quick_search and calling run_search applies smart_filter automatically.
+        w.quick_search = "alice".into();
+        w.run_search();
+        assert_eq!(
+            w.filter, "(|(uid=alice)(cn=*alice*)(mail=alice))",
+            "run_search must apply quick_search when filter is still default"
+        );
+        assert!(w.busy);
+        // Final page (next = None) reports End of results.
+        w.busy = false;
+        w.accept_response(
+            w.generation,
+            Response::Page(
+                Key::Search,
+                fixture_query(),
+                500,
+                Box::new(fixture_page(1)),
+                true,
+            ),
+        );
+        assert!(
+            w.status.starts_with("End of results · 500 rows"),
+            "unexpected final page status: {}",
+            w.status
+        );
+    }
+    #[test]
+    fn quick_search_preserves_hand_edited_filter_until_use_smart_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = workspace(dir.path().join("profiles.json"));
+        w.accept_response(
+            w.generation,
+            Response::Connected(vec!["dc=example,dc=org".into()]),
+        );
+        // When filter is still default or matches the last generated filter, typing in quick_search updates it.
+        w.quick_search = "al".into();
+        w.sync_quick_search_filter();
+        assert_eq!(w.filter, "(|(uid=al)(cn=*al*)(mail=al))");
+        w.quick_search = "alice".into();
+        w.sync_quick_search_filter();
+        assert_eq!(w.filter, "(|(uid=alice)(cn=*alice*)(mail=alice))");
+
+        // User hand-edits the LDAP filter field.
+        w.filter = "(&(objectClass=person)(uid=alice))".into();
+        // Subsequent keystrokes in quick_search or running search must NOT overwrite the hand-edited filter.
+        w.quick_search = "bob".into();
+        w.sync_quick_search_filter();
+        assert_eq!(
+            w.filter, "(&(objectClass=person)(uid=alice))",
+            "hand-edited LDAP filter must not be overwritten by quick_search keystrokes"
+        );
+        w.run_search();
+        assert_eq!(
+            w.filter, "(&(objectClass=person)(uid=alice))",
+            "run_search must preserve hand-edited LDAP filter"
+        );
+        w.busy = false;
+
+        // Explicitly clicking "Use smart filter" replaces the filter and re-couples quick_search.
+        assert!(w.apply_quick_search_filter());
+        assert_eq!(w.filter, "(|(uid=bob)(cn=*bob*)(mail=bob))");
+        w.quick_search = "carol".into();
+        w.sync_quick_search_filter();
+        assert_eq!(w.filter, "(|(uid=carol)(cn=*carol*)(mail=carol))");
+    }
+    #[test]
+    fn ldif_file_load_and_save_report_specific_errors_and_create_0600_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = workspace(dir.path().join("profiles.json"));
+        w.transfer = "dn: cn=Alice,dc=example\ncn: Alice\n".into();
+        // Empty path
+        w.file.clear();
+        w.load_ldif_file();
+        assert!(w.status.contains("enter a file path"));
+        w.save_ldif_file();
+        assert!(w.status.contains("enter a file path"));
+        // Missing file on load
+        w.file = dir.path().join("missing.ldif").to_str().unwrap().into();
+        w.load_ldif_file();
+        assert!(w.status.contains("file not found"));
+        // Directory path on load
+        w.file = dir.path().to_str().unwrap().into();
+        w.load_ldif_file();
+        assert!(w.status.contains("path is a directory"));
+        // Missing parent directory on save
+        w.file = dir
+            .path()
+            .join("no-such-folder")
+            .join("out.ldif")
+            .to_str()
+            .unwrap()
+            .into();
+        w.save_ldif_file();
+        assert!(w.status.contains("parent folder does not exist"));
+        // Save new file succeeds and sets 0600 on Unix; second save refuses to overwrite.
+        let target = dir.path().join("exported.ldif");
+        w.file = target.to_str().unwrap().into();
+        w.save_ldif_file();
+        assert_eq!(w.status, "LDIF saved to new file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        w.save_ldif_file();
+        assert!(w.status.contains("file already exists"));
+        // Load saved file back into transfer draft.
+        w.transfer.clear();
+        w.load_ldif_file();
+        assert!(w.transfer.contains("cn: Alice"));
+        assert_eq!(w.status, "LDIF file loaded into draft");
+    }
+    #[test]
+    fn ldap_code_descriptions_cover_common_rfc4511_errors() {
+        for (rc, expected) in [
+            (32, "noSuchObject"),
+            (34, "invalidDNSyntax"),
+            (49, "invalidCredentials"),
+            (50, "insufficientAccessRights"),
+            (53, "unwillingToPerform"),
+            (65, "objectClassViolation"),
+            (68, "entryAlreadyExists"),
+        ] {
+            assert!(
+                crate::directory::ldap_code_description(rc).contains(expected),
+                "rc {rc} missing {expected}"
+            );
+        }
     }
 }

@@ -51,6 +51,7 @@ class Release(unittest.TestCase):
     def test_alpha_validation_and_archive_path_and_metadata_guards(self):
         package, draft = load('release_package'), load('release_draft')
         self.assertEqual(package.version('v0.1.0-alpha.1'), '0.1.0-alpha.1')
+        self.assertEqual(package.version('v0.1.0-alpha.3'), '0.1.0-alpha.3')
         for tag in ('v0.1.0', 'v1.0.0-alpha.1', 'v0.1.0-alpha.0', 'v0.1.0-alpha.1\n', '../main'):
             with self.assertRaises(ValueError): package.version(tag)
         with tempfile.TemporaryDirectory() as tmp:
@@ -69,9 +70,9 @@ class Release(unittest.TestCase):
         for _, target, suffix in draft.TARGETS.values():
             group = directory / target
             group.mkdir()
-            name = f'dirlark-0.1.0-alpha.1-{target}{suffix}'
+            name = f'dirlark-0.1.0-alpha.3-{target}{suffix}'
             root = name.removesuffix(suffix)
-            metadata = {'version': '0.1.0-alpha.1', 'source_commit': commit, 'target': target, 'signed': False, 'notarized': False}
+            metadata = {'version': '0.1.0-alpha.3', 'source_commit': commit, 'target': target, 'signed': False, 'notarized': False}
             # Test collect without building/executing a binary; archive parsing is
             # covered separately for paths and metadata. Extension remains real.
             path = group / name
@@ -95,24 +96,24 @@ class Release(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             draft, commit = self.fixtures(root)
-            self.assertEqual(len(draft.collect(root, 'v0.1.0-alpha.1', commit)), 6)
-            with self.assertRaises(ValueError): draft.collect(root, 'v0.1.0-alpha.1', 'b' * 40)
+            self.assertEqual(len(draft.collect(root, 'v0.1.0-alpha.3', commit)), 6)
+            with self.assertRaises(ValueError): draft.collect(root, 'v0.1.0-alpha.3', 'b' * 40)
             item = next(root.glob('*/SHA256SUMS-*'))
             item.write_text('invalid hash')
-            with self.assertRaises(ValueError): draft.collect(root, 'v0.1.0-alpha.1', commit)
+            with self.assertRaises(ValueError): draft.collect(root, 'v0.1.0-alpha.3', commit)
 
     def test_draft_uses_verify_tag_and_never_publishes_or_overwrites(self):
         draft = load('release_draft')
         env = {'GITHUB_REPOSITORY': draft.REPOSITORY, 'GITHUB_EVENT_NAME': 'push',
-               'GITHUB_REF': 'refs/tags/v0.1.0-alpha.1', 'GITHUB_SHA': 'a' * 40}
+               'GITHUB_REF': 'refs/tags/v0.1.0-alpha.3', 'GITHUB_SHA': 'a' * 40}
         with patch.dict('os.environ', env, clear=True), patch.object(draft.subprocess, 'run') as run, patch.object(draft.subprocess, 'check_output', return_value='{"isDraft":true,"isPrerelease":true}'):
-            draft.draft('v0.1.0-alpha.1', 'a' * 40, [])
+            draft.draft('v0.1.0-alpha.3', 'a' * 40, [])
             command = run.call_args.args[0]
             for flag in ('--verify-tag', '--draft', '--prerelease', '--latest=false'): self.assertIn(flag, command)
             self.assertNotIn('--clobber', command)
             self.assertEqual(command[:3], ['gh', 'release', 'create'])
         with patch.dict('os.environ', {}, clear=True), patch.object(draft.subprocess, 'run') as run:
-            with self.assertRaises(ValueError): draft.draft('v0.1.0-alpha.1', 'a' * 40, [])
+            with self.assertRaises(ValueError): draft.draft('v0.1.0-alpha.3', 'a' * 40, [])
             run.assert_not_called()
 
     def test_macos_seal_runs_before_archive_and_is_reverified_after(self):
@@ -141,6 +142,26 @@ class Release(unittest.TestCase):
             archive = Path(tmp) / 'pkg.zip'
             materials.archive_tree(root, archive, True)
             package.verify_macos_archive(archive, 'pkg')
+
+    def test_system_clipboard_dependency_graph_is_enabled_on_all_release_targets(self):
+        for target in ('aarch64-apple-darwin', 'x86_64-unknown-linux-gnu', 'x86_64-pc-windows-msvc'):
+            tree = subprocess.check_output(
+                ['cargo', 'tree', '--locked', '--target', target, '-e', 'normal', '-i', 'arboard'],
+                cwd=ROOT,
+                text=True,
+            )
+            self.assertIn('arboard v', tree, target)
+            self.assertIn('egui-winit v', tree, target)
+            self.assertIn('eframe v', tree, target)
+
+    def test_release_packager_remaps_local_build_paths(self):
+        release_pkg = load('release_package')
+        flags = release_pkg.remap_rustflags(('-C', 'target-feature=+crt-static'))
+        self.assertIn(f'--remap-path-prefix={Path.home().resolve()}=/build/home', flags)
+        self.assertIn(f'--remap-path-prefix={Path.cwd().resolve()}=/build/src', flags)
+        self.assertIn('=/build/cargo', flags)
+        self.assertIn('=/build/rustup', flags)
+        self.assertIn('-C target-feature=+crt-static', flags)
 
 
 if __name__ == '__main__':

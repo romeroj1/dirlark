@@ -19,6 +19,85 @@ pub const TIMEOUT: Duration = Duration::from_secs(15);
 fn network_error(_: impl std::fmt::Display) -> String {
     "LDAP operation failed; verify TLS trust, hostname, connectivity and access rights".into()
 }
+fn endpoint_host(endpoint: &str) -> String {
+    url::Url::parse(endpoint)
+        .ok()
+        .and_then(|u| u.host_str().map(String::from))
+        .unwrap_or_else(|| endpoint.into())
+}
+pub fn connect_error(err: &ldap3::LdapError, endpoint: &str) -> String {
+    let host = endpoint_host(endpoint);
+    let combined = format!("{err} {err:?}");
+    let lower = combined.to_ascii_lowercase();
+    if combined.contains("NotValidForName") || lower.contains("not valid for") {
+        format!(
+            "TLS certificate hostname mismatch for {host}: certificate is not valid for this host. Connect using a DNS name on the certificate; TLS verification cannot be disabled"
+        )
+    } else if combined.contains("UnknownIssuer") || lower.contains("unknown issuer") {
+        "TLS certificate issuer is not trusted (unknown CA). Add the issuing CA PEM under TLS trust · extra CA bundle; TLS verification cannot be disabled".into()
+    } else if combined.contains("Expired")
+        || lower.contains("certificate has expired")
+        || combined.contains("NotValidYet")
+        || lower.contains("not valid yet")
+    {
+        "TLS certificate has expired or is not yet valid; renew the server certificate. TLS verification cannot be disabled".into()
+    } else if combined.contains("InvalidCertificate")
+        || combined.contains("AlertReceived")
+        || lower.contains("certificate")
+        || lower.contains("handshake")
+    {
+        "TLS handshake failed: server certificate or TLS parameters were rejected; TLS verification cannot be disabled".into()
+    } else if matches!(err, ldap3::LdapError::Timeout { .. }) || lower.contains("timed out") {
+        format!("Connection to {host} timed out; verify the endpoint host, port and firewall rules")
+    } else if lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("unreachable")
+    {
+        format!(
+            "Connection to {host} was refused or unreachable; verify the LDAPS server is listening on the endpoint host and port"
+        )
+    } else if lower.contains("lookup address")
+        || lower.contains("nodename nor servname")
+        || lower.contains("name or service not known")
+        || lower.contains("no such host")
+    {
+        format!("DNS lookup failed for {host}; verify the endpoint hostname")
+    } else {
+        "LDAP connection failed; verify TLS trust, hostname, connectivity and access rights. TLS verification cannot be disabled".into()
+    }
+}
+pub fn ldap_code_description(rc: u32) -> &'static str {
+    match rc {
+        1 => "operationsError — server internal error",
+        2 => "protocolError — request did not match server protocol rules",
+        7 => "authMethodNotSupported — authentication method is not supported",
+        8 => "strongerAuthRequired — server requires stronger authentication",
+        10 => "referral — target entry resides on another server",
+        12 => "unavailableCriticalExtension — required control is not supported",
+        13 => "confidentialityRequired — TLS confidentiality is required",
+        16 => "noSuchAttribute — requested attribute does not exist on the entry",
+        17 => "undefinedAttributeType — attribute type is not defined in schema",
+        18 => "inappropriateMatching — filter or sort rule does not match attribute syntax",
+        19 => "constraintViolation — attribute value violates a directory constraint",
+        20 => "attributeOrValueExists — attribute or value already exists on the entry",
+        21 => "invalidAttributeSyntax — attribute value has invalid syntax",
+        32 => "noSuchObject — base or target DN does not exist",
+        33 => "aliasProblem — alias could not be dereferenced",
+        34 => "invalidDNSyntax — distinguished name has invalid syntax",
+        48 => "inappropriateAuthentication — bind credentials do not match authentication type",
+        49 => "invalidCredentials — wrong bind DN or password",
+        50 => "insufficientAccessRights — current identity does not have permission",
+        51 => "busy — server is too busy to process the operation",
+        52 => "unavailable — server is unavailable",
+        53 => "unwillingToPerform — server refused to perform the operation",
+        64 => "namingViolation — RDN violates naming rules",
+        65 => "objectClassViolation — entry violates objectClass schema rules",
+        66 => "notAllowedOnNonLeaf — operation is not allowed on an entry with children",
+        67 => "notAllowedOnRDN — cannot remove or modify the RDN attribute directly",
+        68 => "entryAlreadyExists — target entry already exists",
+        _ => "operation was not successful",
+    }
+}
 fn check(result: ldap3::LdapResult) -> Result<(), String> {
     if result.rc == 0 {
         Ok(())
@@ -26,8 +105,9 @@ fn check(result: ldap3::LdapResult) -> Result<(), String> {
         Err(limit_message(result.rc))
     } else {
         Err(format!(
-            "LDAP result {} (operation was not successful)",
-            result.rc
+            "LDAP result {} ({})",
+            result.rc,
+            ldap_code_description(result.rc)
         ))
     }
 }
@@ -60,8 +140,11 @@ pub fn tls_config(ca_bundle: &str) -> Result<Arc<rustls::ClientConfig>, String> 
     for cert in rustls_native_certs::load_native_certs().certs {
         let _ = roots.add(cert);
     }
-    if !ca_bundle.is_empty() {
-        let bytes = fs::read(ca_bundle).map_err(|_| "Cannot read selected CA bundle")?;
+    if !ca_bundle.trim().is_empty() {
+        let path = crate::model::expand_local_path(ca_bundle)
+            .map_err(|_| "Cannot read selected CA bundle; check the PEM file path")?;
+        let bytes = fs::read(path)
+            .map_err(|_| "Cannot read selected CA bundle; check the PEM file path")?;
         if bytes.len() > 4 * 1024 * 1024 {
             return Err("CA bundle exceeds 4 MiB".into());
         }
@@ -113,8 +196,13 @@ impl Directory {
             LdapConnAsync::with_settings(settings, &profile.endpoint),
         )
         .await
-        .map_err(|_| "Connection timed out")?
-        .map_err(network_error)?;
+        .map_err(|_| {
+            format!(
+                "Connection to {} timed out; verify the endpoint host, port and firewall rules",
+                endpoint_host(&profile.endpoint)
+            )
+        })?
+        .map_err(|err| connect_error(&err, &profile.endpoint))?;
         let driver = tokio::spawn(async move {
             let _ = conn.drive().await;
         });
@@ -332,7 +420,13 @@ impl Directory {
             } else {
                 match mode {
                     Mode::Forward => {
-                        cookie = paging::paged_response(value(paging::PAGED).ok_or("Server omitted the required paging response; restart with a narrower query")?)?;
+                        let missing_paging = if query.base.trim().is_empty() || query.scope == 0 {
+                            "Server omitted the paging control (root DSE or base-scope entry does not paginate); choose a naming-context search base and Subtree scope"
+                        } else {
+                            "Server omitted the required paging response; choose a naming-context search base or narrow the query"
+                        };
+                        cookie =
+                            paging::paged_response(value(paging::PAGED).ok_or(missing_paging)?)?;
                         if !cookie.is_empty() {
                             if entries.is_empty() {
                                 return Err(
@@ -594,7 +688,16 @@ pub enum Request {
         changes: Vec<Change>,
         expected: Option<Entry>,
     },
-    SaveProfiles(std::path::PathBuf, Vec<Profile>),
+    SaveProfiles(std::path::PathBuf, Vec<Profile>, Option<String>),
+    ForgetPassword(
+        Profile,
+        Option<(std::path::PathBuf, Vec<Profile>, Option<String>)>,
+    ),
+    DeleteProfile {
+        profile: Profile,
+        remove_credential: bool,
+        save: Option<(std::path::PathBuf, Vec<Profile>, Option<String>)>,
+    },
 }
 pub enum Response {
     CredentialStatus(Result<(), String>),
@@ -606,6 +709,14 @@ pub enum Response {
     Schema(Vec<Entry>),
     Applied(usize),
     Saved,
+    PasswordForgotten {
+        id: uuid::Uuid,
+        removed: bool,
+    },
+    ProfileDeleted {
+        id: uuid::Uuid,
+        removed_credential: bool,
+    },
     Error(String),
 }
 pub struct Worker {
@@ -685,9 +796,37 @@ async fn execute(directory: &mut Option<Directory>, request: Request) -> Result<
             }
             Ok(Response::Disconnected)
         }
-        Request::SaveProfiles(path, profiles) => {
-            crate::profiles::save(&path, &profiles)?;
+        Request::SaveProfiles(path, profiles, theme) => {
+            crate::profiles::save_with_theme(&path, &profiles, theme.as_deref())?;
             Ok(Response::Saved)
+        }
+        Request::ForgetPassword(profile, save) => {
+            let removed = crate::profiles::delete_saved_password(&profile)?;
+            if let Some((path, profiles, theme)) = save {
+                crate::profiles::save_with_theme(&path, &profiles, theme.as_deref())?;
+            }
+            Ok(Response::PasswordForgotten {
+                id: profile.id,
+                removed,
+            })
+        }
+        Request::DeleteProfile {
+            profile,
+            remove_credential,
+            save,
+        } => {
+            let removed_credential = if remove_credential && !profile.bind_dn.is_empty() {
+                crate::profiles::delete_saved_password(&profile)?
+            } else {
+                false
+            };
+            if let Some((path, profiles, theme)) = save {
+                crate::profiles::save_with_theme(&path, &profiles, theme.as_deref())?;
+            }
+            Ok(Response::ProfileDeleted {
+                id: profile.id,
+                removed_credential,
+            })
         }
         other => {
             let d = directory.as_mut().ok_or("Connect to a directory first")?;

@@ -15,8 +15,8 @@ fn generated_certificate_fields_match_input_and_fingerprints_match_der() {
     assert_eq!(field(cert, "Serial number"), "2a");
     assert!(field(cert, "Public key algorithm").contains("ecPublicKey"));
     assert_eq!(field(cert, "Public key size"), "256 bits");
-    assert!(field(cert, "Not before").starts_with("2024-01-01"));
-    assert!(field(cert, "Not after").starts_with("2030-01-01"));
+    assert_eq!(field(cert, "Not before"), "2024-01-01 00:00:00 UTC");
+    assert_eq!(field(cert, "Not after"), "2030-01-01 00:00:00 UTC");
     assert!(field(cert, "Validity status").starts_with("Expires in "));
     assert_eq!(field(cert, "SAN 1"), "DNS: directory.example.test");
     assert_eq!(field(cert, "SAN 2"), "Email: operator@example.test");
@@ -55,6 +55,54 @@ fn generated_certificate_fields_match_input_and_fingerprints_match_der() {
     );
     assert!(cert.pem.starts_with("-----BEGIN CERTIFICATE-----\n"));
     assert!(!cert.pem.contains("PRIVATE"));
+
+    // Verify non-Z ASN.1 time offsets (02:00:00+02:00 and 19:00:00-05:00) convert to UTC.
+    let old_validity = fixtures::tlv(
+        0x30,
+        &[
+            fixtures::tlv(0x17, b"240101000000Z"),
+            fixtures::tlv(0x17, b"300101000000Z"),
+        ]
+        .concat(),
+    );
+    let new_validity = fixtures::tlv(
+        0x30,
+        &[
+            fixtures::tlv(0x17, b"240101020000+0200"),
+            fixtures::tlv(0x17, b"291231190000-0500"),
+        ]
+        .concat(),
+    );
+    fn split_tlv(bytes: &[u8]) -> (&[u8], &[u8]) {
+        if bytes[1] < 128 {
+            let len = usize::from(bytes[1]);
+            (&bytes[2..2 + len], &bytes[2 + len..])
+        } else {
+            let n = usize::from(bytes[1] & 0x7f);
+            let len = bytes[2..2 + n]
+                .iter()
+                .fold(0usize, |acc, b| (acc << 8) | usize::from(*b));
+            (&bytes[2 + n..2 + n + len], &bytes[2 + n + len..])
+        }
+    }
+    let (cert_body, _) = split_tlv(&der);
+    let (tbs_body, sig_tail) = split_tlv(cert_body);
+    let pos = tbs_body
+        .windows(old_validity.len())
+        .position(|w| w == old_validity.as_slice())
+        .expect("validity TLV present in sample certificate");
+    let mut new_tbs_body = Vec::new();
+    new_tbs_body.extend_from_slice(&tbs_body[..pos]);
+    new_tbs_body.extend_from_slice(&new_validity);
+    new_tbs_body.extend_from_slice(&tbs_body[pos + old_validity.len()..]);
+    let new_der = fixtures::tlv(
+        0x30,
+        &[fixtures::tlv(0x30, &new_tbs_body), sig_tail.to_vec()].concat(),
+    );
+    let offset_result = certificates::inspect(&new_der, Kind::Certificate, NOW).unwrap();
+    let offset_cert = offset_result[0].certificate.as_ref().unwrap();
+    assert_eq!(field(offset_cert, "Not before"), "2024-01-01 00:00:00 UTC");
+    assert_eq!(field(offset_cert, "Not after"), "2030-01-01 00:00:00 UTC");
 }
 #[test]
 fn expired_not_yet_valid_and_ca_are_explicit() {
