@@ -12,9 +12,9 @@ import subprocess
 import tempfile
 import tomllib
 try:
-    from release_materials import archive_tree, licenses
+    from release_materials import archive_tree, install_linux_desktop_files, install_macos_icon, licenses
 except ModuleNotFoundError:
-    from tools.release_materials import archive_tree, licenses
+    from tools.release_materials import archive_tree, install_linux_desktop_files, install_macos_icon, licenses
 
 TARGETS = {
     'windows': ('Windows', 'x86_64-pc-windows-msvc', '.zip'),
@@ -122,14 +122,17 @@ def build(target_os, tag, output):
             contents = root / 'DIRLARK.app' / 'Contents'
             (contents / 'MacOS').mkdir(parents=True)
             shutil.copy2(binary, contents / 'MacOS' / 'dirlark')
+            icon_file = install_macos_icon(contents)
             with (contents / 'Info.plist').open('wb') as stream:
                 plistlib.dump({'CFBundleExecutable': 'dirlark', 'CFBundleIdentifier': 'io.github.romeroj1.dirlark',
-                              'CFBundleName': 'DIRLARK', 'CFBundlePackageType': 'APPL',
+                              'CFBundleName': 'DIRLARK', 'CFBundlePackageType': 'APPL', 'CFBundleIconFile': icon_file,
                               'CFBundleShortVersionString': '0.1.0', 'CFBundleVersion': '1',
                               'NSHighResolutionCapable': True, 'DIRLARKBuildIdentity': stamp}, stream)
             seal_macos_bundle(root / 'DIRLARK.app')
         else:
             shutil.copy2(binary, root / binary.name)
+            if target_os == 'linux':
+                install_linux_desktop_files(root)
         for source in ('LICENSE', 'NOTICE', 'README.md', 'CHANGELOG.md', 'SECURITY.md', f'docs/releases/{stamp}.md'):
             shutil.copyfile(source, root / Path(source).name)
         licenses(root)

@@ -8,7 +8,7 @@ No tag/release is authorized by this checklist. Agents prepare reviewed source/w
 - Run fresh-target native/static/security checks; require public native Windows/macOS/Linux checks green after Johann's push. Review workflow permissions with secops and the complete change with grok.
 - About and --version must identify the same alpha version, exact PUBLIC commit and UTC build date as BUILD.json. No internal source path, hostname, credential or signing identity in assets.
 - Verify SHA256SUMS before extraction, archive members/CRC, LICENSE/NOTICE/dependency notices, and a fresh download after draft creation. Checksums are not signatures.
-- Johann reviews source and policy/settings, creates the approved v0.1.0-alpha.3 tag on the public commit, and inspects the resulting **draft pre-release**. Nothing automatically publishes it. He makes it public only after these checks. No agent runs publish.py --answer-yes, tags or release commands.
+- Johann reviews source and policy/settings, creates the approved v0.1.0-alpha.4 tag on the public commit, and inspects the resulting **draft pre-release**. Nothing automatically publishes it. He makes it public only after these checks. No agent runs publish.py --answer-yes, tags or release commands.
 
 ## Windows x64 (Johann; disposable directory/account)
 
@@ -19,7 +19,7 @@ No tag/release is authorized by this checklist. Agents prepare reviewed source/w
 
 ## macOS arm64 (Johann)
 
-- Verify ZIP hash; copy app to a user-writable Applications folder, record OS/hardware, launch through the normal permitted per-app Gatekeeper flow. Never disable Gatekeeper or clear quarantine globally.
+- Verify ZIP hash; if the notes claim Developer ID signing, run the codesign/spctl/stapler checks from the README (and `docs/releases/signing.md` post-signing checks, including a keychain save/forget round trip with the signed app); copy app to a user-writable Applications folder, record OS/hardware, launch through the normal permitted per-app Gatekeeper flow. Never disable Gatekeeper or clear quarantine globally.
 - Check About/--version, layout/scaling, anonymous verified LDAPS, certificate view, previews/cancel and profile persistence. With a disposable profile/identity, exercise opt-in Keychain create/read/delete and locked/denied behavior; do not access unrelated entries. Intel is outside this release.
 
 ## Linux x86_64 (Johann or designated tester)

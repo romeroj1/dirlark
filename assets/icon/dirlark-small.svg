@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>DIRLARK (small sizes)</title>
+  <!-- Same design with heavier strokes and taller rows so it stays legible at 16-32 px. Used for sizes up to 32. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0369a1"/>
+      <stop offset="1" stop-color="#082f49"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="200" fill="url(#bg)"/>
+  <g fill="none" stroke="#7dd3fc" stroke-width="72" stroke-linecap="butt" stroke-linejoin="round">
+    <path d="M200 280V760M200 512H340M200 760H340"/>
+  </g>
+  <rect x="120" y="190" width="600" height="180" rx="90" fill="#ffffff"/>
+  <rect x="300" y="422" width="620" height="180" rx="90" fill="#ffffff"/>
+  <rect x="300" y="670" width="620" height="180" rx="90" fill="#fbbf24"/>
+</svg>

@@ -2,6 +2,7 @@ mod about;
 mod certificate_view;
 #[cfg(debug_assertions)]
 pub mod evidence;
+mod icons;
 mod output;
 mod theme;
 use crate::{
@@ -85,6 +86,7 @@ pub struct Workspace {
     logs: VecDeque<String>,
     smoke: Option<crate::smoke::SmokeCapture>,
     connection_screen_visible: bool,
+    reset_connection_scroll: bool,
     #[cfg(test)]
     rendered_rows: (usize, usize),
 }
@@ -104,6 +106,7 @@ impl Workspace {
         legacy: Option<PathBuf>,
         smoke: bool,
     ) -> Self {
+        icons::install_font(&ctx);
         theme::install(&ctx);
         let loaded = path
             .as_ref()
@@ -239,6 +242,7 @@ impl Workspace {
             logs,
             smoke: smoke.then(crate::smoke::SmokeCapture::new),
             connection_screen_visible: false,
+            reset_connection_scroll: false,
             #[cfg(test)]
             rendered_rows: (0, 0),
         }
@@ -338,7 +342,7 @@ impl Workspace {
                 base: dn,
                 scope: 1,
                 filter: "(objectClass=*)".into(),
-                attrs: vec!["numSubordinates".into()],
+                attrs: vec!["numSubordinates".into(), "objectClass".into()],
                 sort: self.sort.clone(),
                 ordering_rule: self.ordering_rule.clone(),
             },
@@ -642,9 +646,16 @@ impl Workspace {
         self.password = Zeroizing::new(String::new());
         self.confirm_delete_profile = false;
         self.delete_profile_credential = true;
+        self.reset_connection_scroll = true;
     }
     fn connect(&mut self) {
         if self.connected || self.busy {
+            return;
+        }
+        if self.profile.bind_dn.trim().is_empty()
+            && (!self.password.is_empty() || self.remember || self.profile.password_saved)
+        {
+            self.note(crate::directory::BLANK_BIND_DN_WITH_PASSWORD.into());
             return;
         }
         self.generation += 1;
@@ -819,9 +830,10 @@ impl Workspace {
         ui.horizontal_wrapped(|ui| {
             if has_saved_password {
                 let indicator = if self.credential_locked_notice.is_some() {
-                    "🔒 Password saved in keychain (unavailable: locked or access denied)"
+                    icons::Icon::KeychainSaved
+                        .text("Password saved in keychain (unavailable: locked or access denied)")
                 } else {
-                    "🔒 Password saved in keychain"
+                    icons::Icon::KeychainSaved.text("Password saved in keychain")
                 };
                 ui.label(
                     egui::RichText::new(indicator)
@@ -840,7 +852,7 @@ impl Workspace {
                 }
             } else {
                 ui.label(
-                    egui::RichText::new("No saved password")
+                    egui::RichText::new(icons::Icon::KeychainEmpty.text("No saved password"))
                         .small()
                         .color(theme::colors(ui).muted),
                 );
@@ -916,18 +928,20 @@ impl Workspace {
         if self.connected {
             if compact {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new("TLS verified").color(theme::colors(ui).accent))
-                        .on_hover_text(format!(
-                            "{}\nIdentity: {}",
-                            self.profile.endpoint,
-                            if self.profile.bind_dn.is_empty() {
-                                "Anonymous"
-                            } else {
-                                &self.profile.bind_dn
-                            }
-                        ));
-                    if ui
-                        .add_enabled(!self.busy, egui::Button::new("Disconnect"))
+                    ui.label(
+                        egui::RichText::new(icons::Icon::TlsVerified.text("TLS verified"))
+                            .color(theme::colors(ui).accent),
+                    )
+                    .on_hover_text(format!(
+                        "{}\nIdentity: {}",
+                        self.profile.endpoint,
+                        if self.profile.bind_dn.is_empty() {
+                            "Anonymous"
+                        } else {
+                            &self.profile.bind_dn
+                        }
+                    ));
+                    if icons::button(ui, icons::Icon::Disconnect, "Disconnect", !self.busy)
                         .clicked()
                     {
                         self.disconnect();
@@ -935,7 +949,7 @@ impl Workspace {
                 });
             } else {
                 ui.label(
-                    egui::RichText::new("TLS verified")
+                    egui::RichText::new(icons::Icon::TlsVerified.text("TLS verified"))
                         .color(theme::colors(ui).accent)
                         .strong(),
                 );
@@ -951,19 +965,19 @@ impl Workspace {
                 };
                 ui.add(egui::Label::new(identity).truncate())
                     .on_hover_text(identity);
-                if ui
-                    .add_enabled(!self.busy, egui::Button::new("Disconnect"))
-                    .clicked()
-                {
+                if icons::button(ui, icons::Icon::Disconnect, "Disconnect", !self.busy).clicked() {
                     self.disconnect();
                 }
             }
             let settings = ui.collapsing("Connection settings", |ui| {
                 ui.small("Disconnect before changing server or identity.");
-                egui::ScrollArea::vertical()
+                let mut area = egui::ScrollArea::vertical()
                     .id_salt("connection-settings")
-                    .max_height(210.0)
-                    .show(ui, |ui| self.connection_fields(ui));
+                    .max_height(210.0);
+                if self.reset_connection_scroll {
+                    area = area.vertical_scroll_offset(0.0);
+                }
+                area.show(ui, |ui| self.connection_fields(ui));
                 if self.has_unsaved_profile_edits() {
                     ui.small("Unsaved profile edits — click Save profile to keep changes across restarts.");
                 }
@@ -986,10 +1000,14 @@ impl Workspace {
                 }
             }
         } else {
-            egui::ScrollArea::vertical()
+            let mut area = egui::ScrollArea::vertical()
                 .id_salt("connection-fields")
-                .max_height((ui.available_height() - 185.0).max(100.0))
-                .show(ui, |ui| self.connection_fields(ui));
+                .max_height((ui.available_height() - 185.0).max(100.0));
+            if self.reset_connection_scroll {
+                area = area.vertical_scroll_offset(0.0);
+            }
+            area.show(ui, |ui| self.connection_fields(ui));
+            self.reset_connection_scroll = false;
             ui.add_space(4.0);
             if self.has_unsaved_profile_edits() {
                 ui.small(
@@ -998,7 +1016,10 @@ impl Workspace {
             }
             let is_saved_profile = self.profiles.iter().any(|p| p.id == self.profile.id);
             ui.horizontal_wrapped(|ui| {
-                let connect = theme::primary(ui, "Connect", !self.busy);
+                let connect = theme::primary(ui, &icons::Icon::Connect.text("Connect"), !self.busy);
+                connect.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::Role::Button, !self.busy, "Connect")
+                });
                 self.connection_screen_visible &= ui.is_rect_visible(connect.rect);
                 if connect.clicked() {
                     self.connect();
@@ -1044,7 +1065,7 @@ impl Workspace {
         ui.add_space(4.0);
         ui.label(egui::RichText::new("Directory").size(16.0).strong());
         ui.horizontal(|ui| {
-            ui.small("Rows per page");
+            ui.small("Rows per page (25-500)");
             ui.add_enabled(
                 !self.busy,
                 egui::DragValue::new(&mut self.page_size).range(25..=500),
@@ -1111,9 +1132,10 @@ impl Workspace {
                                 {
                                     action = Some(TreeAction::Toggle(dn.clone(), loaded));
                                 }
-                                let label = count
+                                let name = count
                                     .map(|n| format!("{} · {n} children", rdn_label(dn)))
                                     .unwrap_or_else(|| rdn_label(dn).to_string());
+                                let label = row.icon.text(&name);
                                 let response = ui
                                     .push_id(("tree-node", dn), |ui| {
                                         ui.add(
@@ -1128,6 +1150,21 @@ impl Workspace {
                                     })
                                     .inner
                                     .on_hover_text(dn);
+                                {
+                                    let selected =
+                                        self.pending_read.as_deref().or_else(|| {
+                                            self.selected.as_ref().map(|e| e.dn.as_str())
+                                        }) == Some(dn.as_str());
+                                    let accessible = name.clone();
+                                    response.widget_info(move || {
+                                        egui::WidgetInfo::selected(
+                                            egui::Role::Button,
+                                            true,
+                                            selected,
+                                            &accessible,
+                                        )
+                                    });
+                                }
                                 if self
                                     .pending_read
                                     .as_deref()
@@ -1265,7 +1302,7 @@ impl Workspace {
                 egui::Label::new(egui::RichText::new(&entry.dn).monospace()).truncate(),
             )
             .on_hover_text(&entry.dn);
-            if ui.button("Copy DN").clicked() {
+            if icons::compact(ui, icons::Icon::Copy, "Copy DN").clicked() {
                 ui.ctx().copy_text(entry.dn.clone());
             }
         });
@@ -1329,7 +1366,7 @@ impl Workspace {
                                         ui.push_id((name,index), |ui| {
                                             ui.horizontal_wrapped(|ui| {
                                                 ui.label(format!("Value {} of {} · {} bytes",index+1,values.len(),value.len()));
-                                                if ui.button("View certificate").clicked() {self.certificate_viewer=certificate_view::Viewer::new(&entry,name,index);}
+                                                if icons::button(ui, icons::Icon::Certificate, "View certificate", true).clicked() {self.certificate_viewer=certificate_view::Viewer::new(&entry,name,index);}
                                             });
                                             ui.collapsing("Raw value · base64", |ui| {
                                                 if value.len() <= crate::certificates::MAX_VALUE { output::show(ui,"DER / container · base64",&STANDARD.encode(value)); }
@@ -1342,10 +1379,12 @@ impl Workspace {
                                         let text = display(value);
                                         ui.horizontal_wrapped(|ui| {
                                             ui.add(egui::Label::new(&text).wrap());
-                                            if ui
-                                                .small_button("Copy")
-                                                .on_hover_text(format!("Copy {name} value"))
-                                                .clicked()
+                                            if icons::compact(
+                                                ui,
+                                                icons::Icon::Copy,
+                                                &format!("Copy {name} value"),
+                                            )
+                                            .clicked()
                                             {
                                                 ui.ctx().copy_text(text.clone());
                                             }
@@ -1583,9 +1622,9 @@ impl Workspace {
                 ui.radio_value(&mut self.scope, index, *name);
             }
             ui.add_space(8.0);
-            ui.small("Rows per page");
+            ui.small("Rows per page (25-500)");
             ui.add(egui::DragValue::new(&mut self.page_size).range(25..=500));
-            if run && theme::primary(ui, "Run search", self.connected && !self.busy).clicked() {
+            if run && run_search_button(ui, self.connected && !self.busy).clicked() {
                 self.run_search();
             }
         });
@@ -1596,7 +1635,7 @@ impl Workspace {
         if compact {
             ui.horizontal_wrapped(|ui| {
                 ui.toggle_value(&mut self.query_details, "Edit query");
-                if theme::primary(ui, "Run search", self.connected && !self.busy).clicked() {
+                if run_search_button(ui, self.connected && !self.busy).clicked() {
                     self.run_search();
                 }
             });
@@ -1677,7 +1716,7 @@ impl Workspace {
             } else {
                 "Ready when you are"
             });
-            ui.label(if completed{"Check the base, scope and filter, or confirm that this identity has search access. A zero-row page does not prove the directory is empty."}else{"Define a base and filter, then Run search. No subtree is downloaded in advance."});
+            ui.label(if completed{"Check the base, scope and filter, or confirm that this identity has search access. Quick search matches literal text (an asterisk is not a wildcard); use the LDAP filter box for wildcards such as (uid=td00*). A zero-row page does not prove the directory is empty."}else{"Define a base and filter, then Run search. No subtree is downloaded in advance."});
         }
         let mut open = None;
         let mut load_more = false;
@@ -1719,7 +1758,14 @@ impl Workspace {
                                         open = Some(entry.dn.clone());
                                     }
                                     response.context_menu(|ui| {
-                                        if ui.button("Copy distinguished name").clicked() {
+                                        if icons::button(
+                                            ui,
+                                            icons::Icon::Copy,
+                                            "Copy distinguished name",
+                                            true,
+                                        )
+                                        .clicked()
+                                        {
                                             ui.ctx().copy_text(entry.dn.clone());
                                             ui.close();
                                         }
@@ -2059,6 +2105,7 @@ struct TreeRow {
     depth: usize,
     kind: TreeKind,
     source: Option<(Key, u32)>,
+    icon: icons::Icon,
 }
 enum TreeAction {
     Toggle(String, bool),
@@ -2078,6 +2125,11 @@ fn tree_neighbor(rows: &[TreeRow], index: usize, key: egui::Key) -> Option<usize
         }),
         _ => None,
     }
+}
+fn run_search_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
+    let response = theme::primary(ui, &icons::Icon::Search.text("Run search"), enabled);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, "Run search"));
+    response
 }
 fn tree_rows(roots: &[String], cache: &PageCache) -> Vec<TreeRow> {
     fn children(
@@ -2101,6 +2153,7 @@ fn tree_rows(roots: &[String], cache: &PageCache) -> Vec<TreeRow> {
                     "Earlier children evicted · collapse/reload to revisit".into(),
                 ),
                 source: None,
+                icon: icons::Icon::Other,
             });
         }
         for (offset, entry) in cache.entries(&key) {
@@ -2118,6 +2171,7 @@ fn tree_rows(roots: &[String], cache: &PageCache) -> Vec<TreeRow> {
                 depth: depth + 1,
                 kind: TreeKind::Node(entry.dn.clone(), count),
                 source: Some((key.clone(), offset)),
+                icon: icons::node_icon(&entry.values("objectClass"), &entry.dn),
             });
             children(&entry.dn, depth + 1, cache, seen, rows);
         }
@@ -2126,6 +2180,7 @@ fn tree_rows(roots: &[String], cache: &PageCache) -> Vec<TreeRow> {
                 depth: depth + 1,
                 kind: TreeKind::Notice("No child entries".into()),
                 source: None,
+                icon: icons::Icon::Other,
             });
         }
         if let Some(message) = &query.warning {
@@ -2133,6 +2188,7 @@ fn tree_rows(roots: &[String], cache: &PageCache) -> Vec<TreeRow> {
                 depth: depth + 1,
                 kind: TreeKind::Notice(message.clone()),
                 source: None,
+                icon: icons::Icon::Other,
             });
         }
         if query.next.is_some() {
@@ -2140,6 +2196,7 @@ fn tree_rows(roots: &[String], cache: &PageCache) -> Vec<TreeRow> {
                 depth: depth + 1,
                 kind: TreeKind::More(dn.to_string()),
                 source: None,
+                icon: icons::Icon::Other,
             });
         }
     }
@@ -2156,6 +2213,7 @@ fn tree_rows(roots: &[String], cache: &PageCache) -> Vec<TreeRow> {
                     .map(u64::from),
             ),
             source: None,
+            icon: icons::node_icon(&[], root),
         });
         children(root, 0, cache, &mut seen, &mut rows);
     }
@@ -2337,7 +2395,7 @@ impl Workspace {
                         ui.label(egui::RichText::new("Directory workbench").color(palette.muted));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("About").clicked() {
+                        if icons::button(ui, icons::Icon::Info, "About", true).clicked() {
                             self.about_open = true;
                         }
                         let previous = self.appearance;
@@ -2424,8 +2482,7 @@ impl Workspace {
                 });
                 ui.collapsing("Operation log", |ui| {
                     ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(!self.logs.is_empty(), egui::Button::new("Copy log"))
+                        if icons::button(ui, icons::Icon::Copy, "Copy log", !self.logs.is_empty())
                             .clicked()
                         {
                             let joined: Vec<&str> = self.logs.iter().map(String::as_str).collect();
@@ -2453,8 +2510,20 @@ impl Workspace {
             .frame(egui::Frame::new().fill(palette.background).inner_margin(18))
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    for (index, name) in ["Entry", "Search", "Schema", "LDIF"].iter().enumerate() {
-                        ui.selectable_value(&mut self.tab, index, *name);
+                    for (index, (icon, name)) in [
+                        (icons::Icon::Entry, "Entry"),
+                        (icons::Icon::Search, "Search"),
+                        (icons::Icon::Schema, "Schema"),
+                        (icons::Icon::Ldif, "LDIF"),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let selected = self.tab == index;
+                        let response = ui.selectable_value(&mut self.tab, index, icon.text(name));
+                        response.widget_info(move || {
+                            egui::WidgetInfo::selected(egui::Role::Tab, true, selected, name)
+                        });
                     }
                 });
                 ui.add_space(8.0);
@@ -2924,6 +2993,43 @@ mod tests {
         );
     }
     #[test]
+    fn blank_bind_dn_with_password_does_not_connect_but_anonymous_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = workspace(dir.path().join("profiles.json"));
+        w.profile.endpoint = "ldaps://localhost:636".into();
+        w.profile.bind_dn.clear();
+        w.password = Zeroizing::new("synthetic-secret".into());
+        let before = w.generation;
+        w.connect();
+        assert_eq!(
+            w.generation, before,
+            "password with blank Bind DN connected"
+        );
+        assert!(!w.busy);
+        assert_eq!(
+            w.logs.back().map(String::as_str),
+            Some(crate::directory::BLANK_BIND_DN_WITH_PASSWORD)
+        );
+        // A saved password that would be used is refused the same way.
+        w.password = Zeroizing::new(String::new());
+        w.profile.password_saved = true;
+        w.connect();
+        assert_eq!(w.generation, before);
+        // Anonymous connect (blank Bind DN, no password) is unchanged.
+        w.profile.password_saved = false;
+        w.connect();
+        assert_eq!(w.generation, before + 1);
+        assert!(w.busy);
+    }
+    #[test]
+    fn switching_profile_resets_the_connection_form_scroll() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = workspace(dir.path().join("profiles.json"));
+        assert!(!w.reset_connection_scroll);
+        w.select_profile(Profile::default());
+        assert!(w.reset_connection_scroll);
+    }
+    #[test]
     fn keyboard_navigation_never_applies_a_pending_write() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = workspace(dir.path().join("profiles.json"));
@@ -2972,21 +3078,25 @@ mod tests {
                 depth: 0,
                 kind: TreeKind::Node("dc=test".into(), None),
                 source: None,
+                icon: icons::Icon::Other,
             },
             TreeRow {
                 depth: 1,
                 kind: TreeKind::Node("ou=A,dc=test".into(), None),
                 source: None,
+                icon: icons::Icon::Other,
             },
             TreeRow {
                 depth: 1,
                 kind: TreeKind::More("dc=test".into()),
                 source: None,
+                icon: icons::Icon::Other,
             },
             TreeRow {
                 depth: 1,
                 kind: TreeKind::Node("ou=B,dc=test".into(), None),
                 source: None,
+                icon: icons::Icon::Other,
             },
         ];
         assert_eq!(tree_neighbor(&rows, 1, egui::Key::ArrowDown), Some(3));

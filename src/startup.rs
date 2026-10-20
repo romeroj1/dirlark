@@ -174,9 +174,30 @@ fn adapter_index(candidates: &[(bool, bool)], force_software: bool) -> Option<us
         .or_else(|| candidates.iter().position(|(compatible, _)| *compatible))
 }
 
+/// Window/dock icon. macOS uses the padded artwork (the dock does not mask icons); other
+/// platforms use the full-bleed rounded square. Decoded from the embedded PNG, no files or network.
+fn window_icon() -> eframe::egui::IconData {
+    #[cfg(target_os = "macos")]
+    const PNG: &[u8] = include_bytes!("../assets/icon/macos/dirlark-512.png");
+    #[cfg(not(target_os = "macos"))]
+    const PNG: &[u8] = include_bytes!("../assets/icon/png/dirlark-256.png");
+    let image = image::load_from_memory_with_format(PNG, image::ImageFormat::Png)
+        .expect("embedded icon is a valid PNG")
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    eframe::egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    }
+}
+
 pub fn native_options(force_software: bool) -> eframe::NativeOptions {
     let mut options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default().with_inner_size([1200.0, 800.0]),
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([1200.0, 800.0])
+            .with_app_id("dirlark")
+            .with_icon(window_icon()),
         ..Default::default()
     };
     #[cfg(not(target_os = "windows"))]
@@ -286,6 +307,17 @@ mod tests {
             native_options(false).renderer,
             eframe::Renderer::Glow
         ));
+    }
+    #[test]
+    fn window_icon_decodes_to_a_square_rgba_image() {
+        let icon = window_icon();
+        assert_eq!(icon.width, icon.height);
+        assert!(icon.width >= 256);
+        assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
+        // Corners are transparent (rounded square), the centre is opaque artwork.
+        assert_eq!(icon.rgba[3], 0);
+        let centre = ((icon.height / 2 * icon.width + icon.width / 2) * 4 + 3) as usize;
+        assert_eq!(icon.rgba[centre], 255);
     }
     #[test]
     fn diagnostic_log_never_formats_error_payload_and_is_bounded() {

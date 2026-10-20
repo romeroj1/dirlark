@@ -13,3 +13,7 @@ CODE_OF_CONDUCT.md adapts Contributor Covenant version 2.1 by Coraline Ada
 Ehmke and contributors, under Creative Commons Attribution 4.0 International.
 The reporting-contact text is customized. Original attribution is retained;
 see docs/licenses/Contributor-Covenant-CC-BY-4.0.md.
+
+UI icons are a subset of Phosphor Icons (https://phosphoricons.com), MIT
+License, Copyright (c) 2020-2021 Phosphor Icons; the licence text is bundled
+under third-party/ and assets/fonts/phosphor/LICENSE.

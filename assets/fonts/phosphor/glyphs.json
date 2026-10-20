@@ -1,0 +1,27 @@
+{
+  "font": "Phosphor Icons (regular)",
+  "source": "@phosphor-icons/web 2.1.2",
+  "license": "MIT",
+  "glyphs": {
+    "globe-hemisphere-west": "e28c",
+    "folder-simple": "e25a",
+    "user": "e4c2",
+    "users-three": "e68e",
+    "desktop-tower": "e562",
+    "database": "e1de",
+    "plugs-connected": "eb5a",
+    "plug": "e946",
+    "magnifying-glass": "e30c",
+    "tree-structure": "e67c",
+    "file-text": "e23a",
+    "certificate": "e766",
+    "copy": "e1ca",
+    "lock-key": "e2fe",
+    "lock-simple-open": "e30a",
+    "shield-check": "e40c",
+    "warning": "e4e0",
+    "x-circle": "e4f8",
+    "info": "e2ce",
+    "identification-card": "e2c8"
+  }
+}

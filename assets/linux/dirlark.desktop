@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=DIRLARK
+GenericName=LDAP directory workbench
+Comment=Native LDAP directory workbench
+Exec=dirlark
+Icon=dirlark
+Terminal=false
+Categories=Network;Development;
+Keywords=LDAP;directory;LDIF;
+StartupWMClass=dirlark

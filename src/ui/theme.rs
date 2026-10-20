@@ -137,7 +137,12 @@ pub fn note(ui: &mut egui::Ui, title: &str, message: &str, warning: bool) {
         .corner_radius(5)
         .inner_margin(10)
         .show(ui, |ui| {
-            ui.label(egui::RichText::new(title).strong().color(color));
+            let icon = if warning {
+                super::icons::Icon::Warning
+            } else {
+                super::icons::Icon::Error
+            };
+            ui.label(egui::RichText::new(icon.text(title)).strong().color(color));
             ui.add(egui::Label::new(message).wrap());
         });
 }

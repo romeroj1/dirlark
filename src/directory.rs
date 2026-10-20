@@ -182,10 +182,16 @@ impl Drop for Directory {
         self.driver.abort();
     }
 }
+pub const BLANK_BIND_DN_WITH_PASSWORD: &str = "Bind DN is blank: this would connect anonymously and ignore the password. Enter a Bind DN or clear the password.";
+
 impl Directory {
     pub async fn connect(profile: &Profile, password: &str) -> Result<Self, String> {
         profile.validate()?;
-        if !profile.bind_dn.is_empty() && password.is_empty() {
+        let bind_dn = profile.bind_dn.trim();
+        if bind_dn.is_empty() && !password.is_empty() {
+            return Err(BLANK_BIND_DN_WITH_PASSWORD.into());
+        }
+        if !bind_dn.is_empty() && password.is_empty() {
             return Err("Simple bind requires a nonempty password".into());
         }
         let settings = LdapConnSettings::new()
@@ -215,14 +221,7 @@ impl Directory {
         let result = directory
             .ldap
             .with_timeout(TIMEOUT)
-            .simple_bind(
-                &profile.bind_dn,
-                if profile.bind_dn.is_empty() {
-                    ""
-                } else {
-                    password
-                },
-            )
+            .simple_bind(bind_dn, if bind_dn.is_empty() { "" } else { password })
             .await
             .map_err(network_error)?;
         check(result)?;
@@ -764,6 +763,10 @@ async fn execute(directory: &mut Option<Directory>, request: Request) -> Result<
         Request::Connect(p, mut password, remember) => {
             if let Some(mut d) = directory.take() {
                 d.disconnect().await;
+            }
+            if p.bind_dn.trim().is_empty() && (!password.is_empty() || remember || p.password_saved)
+            {
+                return Err(BLANK_BIND_DN_WITH_PASSWORD.into());
             }
             if !p.bind_dn.is_empty() && password.is_empty() {
                 *password = crate::profiles::saved_password(&p)?;

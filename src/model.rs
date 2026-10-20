@@ -29,6 +29,12 @@ impl Default for Profile {
 impl Profile {
     pub fn validate(&self) -> Result<(), String> {
         let u = url::Url::parse(&self.endpoint).map_err(|_| "Enter a valid LDAPS endpoint")?;
+        if u.scheme() == "ldap" {
+            return Err(
+                "Plain ldap:// (unencrypted LDAP or StartTLS) is not allowed; use ldaps://host:port"
+                    .into(),
+            );
+        }
         if u.scheme() != "ldaps"
             || u.host_str().is_none()
             || !u.username().is_empty()
@@ -91,12 +97,24 @@ pub const CREDENTIAL_FRAGMENTS: &[&str] = &[
     "pkcs12",
     "privatekey",
 ];
+/// Non-secret RFC 4512 / draft-behera-ldap-password-policy operational metadata.
+/// Secret-bearing attributes (`userPassword`, `pwdHistory`, `pwdAttribute`, etc.) remain hidden.
+pub const NON_SECRET_PPOLICY_ATTRIBUTES: &[&str] = &[
+    "pwdchangedtime",
+    "pwdpolicysubentry",
+    "pwdaccountlockedtime",
+    "pwdfailuretime",
+    "pwdreset",
+];
 pub fn credential_attribute(description: &str) -> bool {
     let base = description
         .split(';')
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
+    if NON_SECRET_PPOLICY_ATTRIBUTES.contains(&base.as_str()) {
+        return false;
+    }
     CREDENTIAL_FRAGMENTS.iter().any(|part| base.contains(part))
         || CREDENTIAL_ATTRIBUTES.contains(&base.as_str())
 }
@@ -224,7 +242,9 @@ mod tests {
         for name in CREDENTIAL_ATTRIBUTES.iter().copied().chain([
             "customPASSWORD",
             "customSecret;binary",
-            "PwdAccountLockedTime",
+            "pwdHistory",
+            "pwdAttribute",
+            "CustomPwd",
             "customPasswd",
             "krbExtraData;binary",
             "privateKey;binary",
@@ -243,8 +263,14 @@ mod tests {
             "userCertificate;binary",
             "cACertificate",
             "description",
+            "pwdChangedTime",
+            "pwdPolicySubentry",
+            "pwdAccountLockedTime",
+            "PwdAccountLockedTime;binary",
+            "pwdFailureTime",
+            "pwdReset",
         ] {
-            assert!(!credential_attribute(name));
+            assert!(!credential_attribute(name), "{name} should not be hidden");
         }
     }
     #[test]
@@ -283,6 +309,16 @@ mod tests {
     }
     #[test]
     fn endpoint_policy() {
+        let plain_err = Profile {
+            endpoint: "ldap://host:389".into(),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
+        assert!(
+            plain_err.contains("Plain ldap://") && plain_err.contains("not allowed"),
+            "unexpected plain ldap error: {plain_err}"
+        );
         for endpoint in [
             "ldap://host",
             "ldaps://user@host",

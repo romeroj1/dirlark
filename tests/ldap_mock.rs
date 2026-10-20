@@ -115,11 +115,13 @@ impl AsyncWrite for BackpressuredSocket {
     }
 }
 
+type Bind = (Vec<u8>, Vec<u8>);
 struct Mock {
     profile: Profile,
     _ca: tempfile::NamedTempFile,
     task: tokio::task::JoinHandle<()>,
     operations: Arc<Mutex<Vec<u8>>>,
+    binds: Arc<Mutex<Vec<Bind>>>,
     generated: Arc<AtomicUsize>,
     buffered_tails: Arc<AtomicUsize>,
 }
@@ -158,6 +160,8 @@ impl Mock {
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let operations = Arc::new(Mutex::new(vec![]));
         let seen = operations.clone();
+        let binds = Arc::new(Mutex::new(vec![]));
+        let seen_binds = binds.clone();
         let generated = Arc::new(AtomicUsize::new(0));
         let generated_task = generated.clone();
         let buffered_tails = Arc::new(AtomicUsize::new(0));
@@ -167,6 +171,7 @@ impl Mock {
                 stream.set_nodelay(true).unwrap();
                 let acceptor = acceptor.clone();
                 let seen = seen.clone();
+                let seen_binds = seen_binds.clone();
                 let generated = generated_task.clone();
                 let buffered_tails = buffered_task.clone();
                 tokio::spawn(async move {
@@ -208,6 +213,14 @@ impl Mock {
                         let id = &f[0].1;
                         let (op, data) = &f[1];
                         seen.lock().unwrap().push(*op);
+                        if *op == 0x60 {
+                            // Simple bind: version, name, [0] password.
+                            let b = fields(data);
+                            seen_binds
+                                .lock()
+                                .unwrap()
+                                .push((b[1].1.clone(), b[2].1.clone()));
+                        }
                         let mut oversized = false;
                         let mut fragmented = false;
                         let mut truncated = false;
@@ -471,6 +484,7 @@ impl Mock {
             _ca: ca_file,
             task,
             operations,
+            binds,
             generated,
             buffered_tails,
         }
@@ -539,9 +553,35 @@ fn ldaps_protocol_read_write_schema_and_unbind() {
     });
 }
 #[test]
-fn simple_bind_requires_nonempty_secret() {
+fn simple_bind_requires_nonempty_secret_and_rejects_password_with_blank_bind_dn() {
     runtime().block_on(async {
         let mut server = Mock::start("localhost", false).await;
+        // Blank Bind DN with a non-empty password must be rejected locally without sending an anonymous bind.
+        for blank_dn in ["", "   "] {
+            server.profile.bind_dn = blank_dn.into();
+            let err = Directory::connect(&server.profile, "test-only-not-a-real-credential")
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(err, dirlark::directory::BLANK_BIND_DN_WITH_PASSWORD);
+            assert!(
+                server.operations.lock().unwrap().is_empty(),
+                "no LDAP operation may be sent when Bind DN is blank and password is non-empty"
+            );
+        }
+        // Anonymous bind (blank Bind DN and blank password) remains unchanged and succeeds.
+        server.profile.bind_dn.clear();
+        let mut anon = Directory::connect(&server.profile, "").await.unwrap();
+        anon.disconnect().await;
+        // Exactly one bind, with an empty name and an empty password on the wire.
+        assert_eq!(
+            *server.binds.lock().unwrap(),
+            vec![(Vec::<u8>::new(), Vec::<u8>::new())]
+        );
+        server.operations.lock().unwrap().clear();
+        server.binds.lock().unwrap().clear();
+
+        // Non-empty Bind DN with blank password is still rejected without network operations.
         server.profile.bind_dn = "cn=fixture,dc=example".into();
         assert!(Directory::connect(&server.profile, "").await.is_err());
         assert!(server.operations.lock().unwrap().is_empty());
@@ -549,6 +589,43 @@ fn simple_bind_requires_nonempty_secret() {
             .await
             .unwrap();
         c.disconnect().await;
+        // Positive control: an authenticated bind does carry the password, so the capture works.
+        assert_eq!(
+            *server.binds.lock().unwrap(),
+            vec![(
+                b"cn=fixture,dc=example".to_vec(),
+                b"test-only-not-a-real-credential".to_vec()
+            )]
+        );
+    });
+}
+#[test]
+fn simple_bind_sends_the_exact_password_bytes_including_symbols() {
+    // Symbols, quoting characters, LDAP/URL-special characters and non-ASCII text
+    // must reach the server byte-for-byte, with no trimming or re-encoding.
+    let secrets = [
+        "p@ss\"w\\rd!#$%&'()*+,-./:;<=>?[]^_`{|}~",
+        "caf\u{e9}-\u{a3}-\u{20ac}-\u{f8}-\u{1f511}",
+        " leading and trailing space ",
+        "tab\tinside",
+    ];
+    runtime().block_on(async {
+        let mut server = Mock::start("localhost", false).await;
+        server.profile.bind_dn = "uid=test.user,ou=People,dc=example".into();
+        for secret in secrets {
+            let mut c = Directory::connect(&server.profile, secret).await.unwrap();
+            c.disconnect().await;
+        }
+        let seen = server.binds.lock().unwrap();
+        assert_eq!(seen.len(), secrets.len());
+        for ((dn, password), secret) in seen.iter().zip(secrets) {
+            assert_eq!(dn, b"uid=test.user,ou=People,dc=example");
+            assert_eq!(
+                password,
+                secret.as_bytes(),
+                "bind password changed on the wire"
+            );
+        }
     });
 }
 #[test]

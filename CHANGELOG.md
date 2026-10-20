@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.0-alpha.4 — prepared, unreleased
+
+Security update, credential-safety fix, icons and optional macOS Developer ID signing. Windows and Linux archives stay unsigned; whether a macOS download is signed is stated only by the release notes' signing-status line for that archive.
+
+- Security: `rustls-webpki` 0.103.15 -> 0.103.16 (RUSTSEC-2026-0382, distrusted emSign intermediates); the alpha.3 source locked 0.103.15 and no alpha.3 download was ever published (public `main` keeps 0.103.15 until alpha.4).
+- A password (typed, remembered or saved) with a blank Bind DN no longer connects (it silently bound anonymously); anonymous connect without a password is unchanged. Bind-on-the-wire tests added.
+- Non-secret ppolicy operational attributes (`pwdChangedTime`, `pwdPolicySubentry`, `pwdAccountLockedTime`, `pwdFailureTime`, `pwdReset`) are displayed; `userPassword`, `pwdHistory` and other credential-like attributes stay hidden.
+- Application icon (macOS, Windows, Linux, window/dock) and an open-licensed UI icon set (Phosphor Icons, MIT) with tree icons by object class, tab/toolbar icons and compact Copy icons with tooltips and accessible names.
+- macOS Developer ID signing and notarization tooling (`tools/sign_notarize_macos.py`, run locally by the maintainer; CI is unchanged).
+- Polish: Rows per page range hint, zero-rows wildcard hint, explicit plain-`ldap://` refusal text, connection form scroll reset on profile switch.
+
+See [alpha.4 notes](docs/releases/0.1.0-alpha.4.md) and [signing process](docs/releases/signing.md).
+
 ## 0.1.0-alpha.3 — prepared, unreleased
 
 Usability, credential-management, diagnostics and packaging fixes following manual macOS testing of alpha.2 (never published). Still unsigned and not Developer-ID signed or notarized.

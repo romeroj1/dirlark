@@ -51,7 +51,6 @@ class Release(unittest.TestCase):
     def test_alpha_validation_and_archive_path_and_metadata_guards(self):
         package, draft = load('release_package'), load('release_draft')
         self.assertEqual(package.version('v0.1.0-alpha.1'), '0.1.0-alpha.1')
-        self.assertEqual(package.version('v0.1.0-alpha.3'), '0.1.0-alpha.3')
         for tag in ('v0.1.0', 'v1.0.0-alpha.1', 'v0.1.0-alpha.0', 'v0.1.0-alpha.1\n', '../main'):
             with self.assertRaises(ValueError): package.version(tag)
         with tempfile.TemporaryDirectory() as tmp:
@@ -70,9 +69,9 @@ class Release(unittest.TestCase):
         for _, target, suffix in draft.TARGETS.values():
             group = directory / target
             group.mkdir()
-            name = f'dirlark-0.1.0-alpha.3-{target}{suffix}'
+            name = f'dirlark-0.1.0-alpha.1-{target}{suffix}'
             root = name.removesuffix(suffix)
-            metadata = {'version': '0.1.0-alpha.3', 'source_commit': commit, 'target': target, 'signed': False, 'notarized': False}
+            metadata = {'version': '0.1.0-alpha.1', 'source_commit': commit, 'target': target, 'signed': False, 'notarized': False}
             # Test collect without building/executing a binary; archive parsing is
             # covered separately for paths and metadata. Extension remains real.
             path = group / name
@@ -96,24 +95,24 @@ class Release(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             draft, commit = self.fixtures(root)
-            self.assertEqual(len(draft.collect(root, 'v0.1.0-alpha.3', commit)), 6)
-            with self.assertRaises(ValueError): draft.collect(root, 'v0.1.0-alpha.3', 'b' * 40)
+            self.assertEqual(len(draft.collect(root, 'v0.1.0-alpha.1', commit)), 6)
+            with self.assertRaises(ValueError): draft.collect(root, 'v0.1.0-alpha.1', 'b' * 40)
             item = next(root.glob('*/SHA256SUMS-*'))
             item.write_text('invalid hash')
-            with self.assertRaises(ValueError): draft.collect(root, 'v0.1.0-alpha.3', commit)
+            with self.assertRaises(ValueError): draft.collect(root, 'v0.1.0-alpha.1', commit)
 
     def test_draft_uses_verify_tag_and_never_publishes_or_overwrites(self):
         draft = load('release_draft')
         env = {'GITHUB_REPOSITORY': draft.REPOSITORY, 'GITHUB_EVENT_NAME': 'push',
-               'GITHUB_REF': 'refs/tags/v0.1.0-alpha.3', 'GITHUB_SHA': 'a' * 40}
+               'GITHUB_REF': 'refs/tags/v0.1.0-alpha.1', 'GITHUB_SHA': 'a' * 40}
         with patch.dict('os.environ', env, clear=True), patch.object(draft.subprocess, 'run') as run, patch.object(draft.subprocess, 'check_output', return_value='{"isDraft":true,"isPrerelease":true}'):
-            draft.draft('v0.1.0-alpha.3', 'a' * 40, [])
+            draft.draft('v0.1.0-alpha.1', 'a' * 40, [])
             command = run.call_args.args[0]
             for flag in ('--verify-tag', '--draft', '--prerelease', '--latest=false'): self.assertIn(flag, command)
             self.assertNotIn('--clobber', command)
             self.assertEqual(command[:3], ['gh', 'release', 'create'])
         with patch.dict('os.environ', {}, clear=True), patch.object(draft.subprocess, 'run') as run:
-            with self.assertRaises(ValueError): draft.draft('v0.1.0-alpha.3', 'a' * 40, [])
+            with self.assertRaises(ValueError): draft.draft('v0.1.0-alpha.1', 'a' * 40, [])
             run.assert_not_called()
 
     def test_macos_seal_runs_before_archive_and_is_reverified_after(self):
@@ -154,14 +153,71 @@ class Release(unittest.TestCase):
             self.assertIn('egui-winit v', tree, target)
             self.assertIn('eframe v', tree, target)
 
-    def test_release_packager_remaps_local_build_paths(self):
-        release_pkg = load('release_package')
-        flags = release_pkg.remap_rustflags(('-C', 'target-feature=+crt-static'))
-        self.assertIn(f'--remap-path-prefix={Path.home().resolve()}=/build/home', flags)
-        self.assertIn(f'--remap-path-prefix={Path.cwd().resolve()}=/build/src', flags)
-        self.assertIn('=/build/cargo', flags)
-        self.assertIn('=/build/rustup', flags)
-        self.assertIn('-C target-feature=+crt-static', flags)
+    def test_icon_assets_are_wired_into_the_public_archives(self):
+        draft = load('release_draft')
+        text = (ROOT / 'tools/release_package.py').read_text()
+        self.assertIn("'CFBundleIconFile': icon_file", text)
+        self.assertIn('install_linux_desktop_files(root)', text)
+        # The draft validator accepts the nested icon paths and the Linux .desktop file.
+        names = ['r/BUILD.json', 'r/LICENSE', 'r/NOTICE', 'r/DEPENDENCIES.json', 'r/dirlark.desktop',
+                 'r/icons/hicolor/256x256/apps/dirlark.png', 'r/DIRLARK.app/Contents/Resources/AppIcon.icns']
+        self.assertEqual(draft.inspect_members(names, {n: 1 for n in names}, lambda n: b'{}', 'r'), {})
+        # Windows gets its icon from build.rs at compile time, so the archive layout is unchanged.
+        self.assertIn('rustc-link-arg-bins', (ROOT / 'build.rs').read_text())
+
+    def test_alpha4_notes_default_to_unsigned_and_stay_public_safe(self):
+        import re
+        notes = (ROOT / 'docs/releases/0.1.0-alpha.4.md').read_text()
+        marker = re.search(r'<!-- signing-status -->(.*?)<!-- /signing-status -->', notes, re.S)
+        self.assertIsNotNone(marker)
+        self.assertIn('not Developer ID signed', marker.group(1))      # true unless the signing tool rewrites it
+        self.assertNotIn('notarized and stapled', marker.group(1))
+        self.assertNotIn('Team ID', marker.group(1))                 # an unsigned default names no signer
+        for name in ('README.md', 'SECURITY.md', 'docs/releases/0.1.0-alpha.4.md'):
+            self.assertIn('4WH9YXBKP7', (ROOT / name).read_text(), name)
+        self.assertIn('do not run', (ROOT / 'README.md').read_text())
+        for name in ('CHANGELOG.md', 'SECURITY.md', 'docs/releases/0.1.0-alpha.4.md'):
+            self.assertNotIn('alpha.3 shipped', (ROOT / name).read_text(), name)
+            self.assertIn('no alpha.3 download', (ROOT / name).read_text().replace('No alpha.3', 'no alpha.3'), name)
+        self.assertEqual(len(re.findall('<!-- signing-status -->', notes)), 1)
+        self.assertEqual(load('release_package').version('v0.1.0-alpha.4'), '0.1.0-alpha.4')
+        for name in ('CHANGELOG.md', 'README.md', 'docs/release-candidate.md', 'docs/releases/0.1.0-alpha.4.md'):
+            self.assertIn('alpha.4', (ROOT / name).read_text(), name)
+        self.assertIn('RUSTSEC-2026-0382', notes)
+        self.assertIn('RUSTSEC-2026-0382', (ROOT / 'CHANGELOG.md').read_text())
+        for name in ('CHANGELOG.md', 'docs/releases/0.1.0-alpha.4.md', 'docs/releases/0.1.0-alpha.3.md', 'SECURITY.md'):
+            text = (ROOT / name).read_text()
+            self.assertIsNone(re.search(r'\b192\.168\.|\b10\.\d+\.\d+\.\d+\b|/Users/|forgejo', text, re.I), name)
+
+    def test_signing_tool_rewrites_only_the_alpha4_marker(self):
+        spec = importlib.util.spec_from_file_location('sign_notarize_macos', ROOT / 'tools/sign_notarize_macos.py')
+        tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tool)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = (ROOT / 'docs/releases/0.1.0-alpha.4.md').read_text()
+            (root / '0.1.0-alpha.4.md').write_text(original)
+            tool.Signer.update_metadata(root, '0.1.0-alpha.4', 'sub-1', 'TEAM')
+            rewritten = (root / '0.1.0-alpha.4.md').read_text()
+            self.assertIn('notarized and stapled', rewritten.split('<!-- /signing-status -->')[0])
+            self.assertIn('Developer ID Team ID TEAM.', rewritten)
+            self.assertIn('TeamIdentifier=TEAM', rewritten)
+            self.assertEqual(rewritten.count('<!-- signing-status -->'), 1)
+            self.assertEqual(rewritten.split('<!-- signing-status -->')[0], original.split('<!-- signing-status -->')[0])
+            self.assertEqual(rewritten.split('<!-- /signing-status -->')[1], original.split('<!-- /signing-status -->')[1])
+
+    def test_release_and_portable_packagers_remap_local_build_paths(self):
+        # tools/package.py (internal test packager) is not part of the public tree.
+        modules = [load('release_package')]
+        if (ROOT / 'tools' / 'package.py').is_file():
+            modules.append(load('package'))
+        for mod in modules:
+            flags = mod.remap_rustflags(('-C', 'target-feature=+crt-static'))
+            self.assertIn(f'--remap-path-prefix={Path.home().resolve()}=/build/home', flags)
+            self.assertIn(f'--remap-path-prefix={Path.cwd().resolve()}=/build/src', flags)
+            self.assertIn('=/build/cargo', flags)
+            self.assertIn('=/build/rustup', flags)
+            self.assertIn('-C target-feature=+crt-static', flags)
 
 
 if __name__ == '__main__':
