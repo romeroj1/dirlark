@@ -65,4 +65,6 @@ make check
 
 On Windows, invoke `python tools/public_ci.py check` if Make/python3 is unavailable. Public CI runs the same native gate on Linux, macOS and Windows; the corrected public snapshot passed all three hosted native gates (Windows, macOS and Linux). These checks do not establish interactive hardware or credential-store coverage; release candidates require their own checks. See [validation scope](docs/validation.md), [CONTRIBUTING](CONTRIBUTING.md), [Code of Conduct](CODE_OF_CONDUCT.md) and [SECURITY](SECURITY.md). Report bugs with synthetic data only.
 
+More: [design and security invariants](docs/design.md), [platform support](docs/platforms.md), [large directories](docs/large-directories.md), [interface notes](docs/ux.md), [validation scope](docs/validation.md), [contributing](CONTRIBUTING.md).
+
 Licensed under [Apache-2.0](LICENSE). Dependencies and Contributor Covenant retain their own licenses and attribution.

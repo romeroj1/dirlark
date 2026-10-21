@@ -89,10 +89,10 @@ def secrets():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("help", "setup", "install-gitleaks", "linux-libs", "check", "check-mac", "secrets"))
+    parser.add_argument("action", choices=("help", "setup", "install-gitleaks", "linux-libs", "check", "check-mac", "secrets", "guard", "advisories"))
     action = parser.parse_args().action
     if action == "help":
-        print("make fmt / lint / test / build / release / check / check-mac / audit / deny / secrets / clean")
+        print("make fmt / lint / test / build / release / check / check-mac / audit / deny / secrets / clean; python3 tools/public_ci.py guard")
     elif action == "install-gitleaks":
         install_gitleaks()
     elif action == "setup":
@@ -112,9 +112,16 @@ def main():
         run("sudo", "apt-get", "install", "-y", "build-essential", "pkg-config", "libdbus-1-dev", "libssl-dev", "libfontconfig1-dev", "libx11-dev", "libxcursor-dev", "libxrandr-dev", "libxi-dev", "libxinerama-dev", "libxkbcommon-dev", "libxcb1-dev", "libwayland-dev", "libegl1-mesa-dev", "libgl1-mesa-dev")
     elif action == "secrets":
         secrets()
+    elif action == "guard":
+        run(sys.executable, "tools/public_guard.py")
+    elif action == "advisories":
+        # Scheduled: a new advisory should fail visibly without waiting for a pull request.
+        run("cargo", "audit")
+        run("cargo", "deny", "check", "advisories", "--hide-inclusion-graph")
     else:
         if action == "check-mac" and platform.system() != "Darwin":
             raise RuntimeError("check-mac requires native macOS")
+        run(sys.executable, "tools/public_guard.py")
         run(sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py")
         for command in (
             ("cargo", "fmt", "--check"),

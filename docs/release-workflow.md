@@ -1,6 +1,6 @@
 # Public alpha release workflow — preparation only
 
-The .github/workflows/release.yml definition is JSON-form YAML (valid YAML; structural tests use the standard library). It is dormant on Forgejo and must be carried into the reviewed sanitized public tree. Do not run it locally or push it to GitHub as an agent. Johann reviews/pushes the public snapshot himself, waits for native CI, then separately approves a tag/release. Creating this file performs no GitHub operation.
+The .github/workflows/release.yml definition is JSON-form YAML (valid YAML; structural tests use the standard library). Changes to it need maintainer review, and only the maintainer pushes `.github/workflows/**`. A tag is created only after native CI is green on the commit it names, and only by the maintainer.
 
 Only push of a v* tag triggers it; there is no workflow_dispatch, PR, workflow_run or pull_request_target path. The helper accepts only 0.1.0 alpha tags, verifies the tag already identifies the checked-out public commit and that it is on origin/main. No automatic tag creation/movement. Windows x64 uses native MSVC with the C runtime statically linked, macOS-15 is native arm64, Linux uses Ubuntu 24.04 x64. No Intel, installers, self-hosted runners, internal registry or signing identity.
 

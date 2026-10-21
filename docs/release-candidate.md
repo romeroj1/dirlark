@@ -1,14 +1,14 @@
 # Release-candidate checklist — Johann and agents
 
-No tag/release is authorized by this checklist. Agents prepare reviewed source/workflows locally and on Forgejo; Johann alone runs the public-export publish helper and approves the tag/draft/publication.
+No tag/release is authorized by this checklist. Agents propose changes as reviewed pull requests; only the maintainer merges release-affecting changes, creates tags and approves the draft and its publication.
 
 ## Source and build (agents, then Johann)
 
-- Review the sanitized public-tree diff against accepted Forgejo main; preserve existing public history and the separate public profile/keychain namespace. Update the external source mapping/review bundle, not internal workflows or lab data in public Git.
-- Run fresh-target native/static/security checks; require public native Windows/macOS/Linux checks green after Johann's push. Review workflow permissions with secops and the complete change with grok.
+- Review the diff since the previous release tag, including `Cargo.lock`, workflow permissions and anything under `.github/` or `tools/release_*`/`tools/sign_*`. Keep the public profile/keychain namespace.
+- Run fresh-target native/static/security checks; require the native Windows/macOS/Linux checks green on the exact commit that will be tagged, and require independent review of the complete change.
 - About and --version must identify the same alpha version, exact PUBLIC commit and UTC build date as BUILD.json. No internal source path, hostname, credential or signing identity in assets.
 - Verify SHA256SUMS before extraction, archive members/CRC, LICENSE/NOTICE/dependency notices, and a fresh download after draft creation. Checksums are not signatures.
-- Johann reviews source and policy/settings, creates the approved v0.1.0-alpha.4 tag on the public commit, and inspects the resulting **draft pre-release**. Nothing automatically publishes it. He makes it public only after these checks. No agent runs publish.py --answer-yes, tags or release commands.
+- The maintainer reviews source and repository settings, creates the approved tag (for example v0.1.0-alpha.4) on the reviewed `main` commit, and inspects the resulting **draft pre-release**. Nothing automatically publishes it. It becomes public only after these checks. Agents do not create tags or releases, and the tag ruleset prevents it.
 
 ## Windows x64 (Johann; disposable directory/account)
 
