@@ -1,0 +1,16 @@
+# Every change needs a code owner. The maintainer owns the whole repository,
+# and the paths below are listed explicitly so they stay owned if the default ever changes.
+*                       @romeroj1
+/.github/               @romeroj1
+/Cargo.toml             @romeroj1
+/Cargo.lock             @romeroj1
+/deny.toml              @romeroj1
+/rust-toolchain.toml    @romeroj1
+/build.rs               @romeroj1
+/SECURITY.md            @romeroj1
+/tools/release_*        @romeroj1
+/tools/sign_*           @romeroj1
+/tools/public_ci.py     @romeroj1
+/tools/public_guard.py  @romeroj1
+/docs/releases/         @romeroj1
+/docs/release-*.md      @romeroj1

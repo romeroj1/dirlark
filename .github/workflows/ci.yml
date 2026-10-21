@@ -39,3 +39,19 @@ jobs:
       - name: Native gate (Windows)
         if: runner.os == 'Windows'
         run: python tools/public_ci.py check
+  guard:
+    name: Public-safety guard
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout the pull request commits without persisted credentials
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check tree content and commit identities
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python3 tools/public_guard.py --base "$BASE_SHA"
