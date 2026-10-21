@@ -68,7 +68,7 @@ class World(base.Fake):
             if self.binary_changes and 'signed' in command[-1]:
                 Path(command[-1]).write_bytes(b'different')
             return base.Result()
-        if command[0].endswith('MacOS/dirlark'):
+        if Path(command[0]).as_posix().endswith('MacOS/dirlark'):
             self.commands.append(list(command))
             if self.selftest == 'hang':
                 raise subprocess.TimeoutExpired(command, 1)
@@ -94,7 +94,7 @@ class World(base.Fake):
             mode = 'fail' if self.fail_upload else (self.upload_script.pop(0) if self.upload_script else 'ok')
             if mode == 'fail':
                 return base.Result(1, err='boom')
-            files = [item for item in rest if item.startswith('/')]
+            files = [item for item in rest if os.path.isabs(item)]
             for item in files[:1] if mode == 'partial' else files:    # partial: the first file lands, then gh fails
                 (self.remote / Path(item).name).write_bytes(Path(item).read_bytes())
             return base.Result(1, err='boom') if mode == 'partial' else base.Result()
