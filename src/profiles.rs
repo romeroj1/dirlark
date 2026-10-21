@@ -210,6 +210,36 @@ pub fn credential(profile: &Profile) -> Result<keyring::Entry, String> {
         .map_err(|_| CREDENTIALS_UNAVAILABLE.into())
 }
 
+/// Release-signing probe: create, read back and delete ONE uniquely named, application-owned
+/// entry. It never reads, lists or changes an existing credential and never prints a value.
+pub fn keychain_selftest() -> Result<(), String> {
+    let profile = Profile {
+        endpoint: "ldaps://keychain-selftest.invalid:636".into(),
+        bind_dn: "cn=temporary-selftest".into(),
+        ..Profile::default()
+    };
+    selftest_roundtrip(&credential(&profile)?)
+}
+
+fn selftest_roundtrip(entry: &keyring::Entry) -> Result<(), String> {
+    let secret = zeroize::Zeroizing::new(uuid::Uuid::new_v4().to_string());
+    entry
+        .set_password(&secret)
+        .map_err(|_| "Cannot create temporary native-store entry".to_string())?;
+    let retrieved = entry.get_password().map(zeroize::Zeroizing::new);
+    let removed = entry.delete_credential();
+    removed.map_err(|_| "Temporary native-store entry cleanup failed".to_string())?;
+    let retrieved =
+        retrieved.map_err(|_| "Native-store read failed; temporary entry deleted".to_string())?;
+    if *retrieved != *secret {
+        return Err("Native-store roundtrip mismatch; temporary entry deleted".into());
+    }
+    if !matches!(entry.get_password(), Err(keyring::Error::NoEntry)) {
+        return Err("Native store did not confirm deletion".into());
+    }
+    Ok(())
+}
+
 pub fn delete_saved_password(profile: &Profile) -> Result<bool, String> {
     credential_status()?;
     let account = credential_account(profile);
@@ -318,6 +348,35 @@ mod tests {
         // Subsequent plain save preserves the existing theme preference.
         save(&p, std::slice::from_ref(&profile)).unwrap();
         assert_eq!(load_config(&p).unwrap().theme.as_deref(), Some("dark"));
+    }
+    #[test]
+    fn keychain_selftest_roundtrips_and_leaves_nothing_behind() {
+        keychain_selftest().unwrap();
+        let existing = Profile::default();
+        credential(&existing)
+            .unwrap()
+            .set_password("keep-me")
+            .unwrap();
+        keychain_selftest().unwrap();
+        assert_eq!(
+            saved_password(&Profile {
+                password_saved: true,
+                ..existing
+            })
+            .unwrap(),
+            "keep-me"
+        );
+    }
+    #[test]
+    fn keychain_selftest_reports_failures_without_values() {
+        credential_status().unwrap();
+        let entry = credential(&Profile::default()).unwrap();
+        let mock: &keyring::mock::Cred = entry.as_any().downcast_ref().unwrap();
+        mock.set_error(keyring::Error::NoStorageAccess(Box::new(
+            std::io::Error::other("keychain locked"),
+        )));
+        let error = selftest_roundtrip(&entry).unwrap_err();
+        assert_eq!(error, "Cannot create temporary native-store entry");
     }
     #[test]
     fn mock_keyring_create_read_delete_and_missing_or_denied_errors() {

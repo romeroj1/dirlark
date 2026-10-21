@@ -5,6 +5,21 @@ fn main() -> ExitCode {
         println!("{}", dirlark::build_info::current().text());
         return ExitCode::SUCCESS;
     }
+    if std::env::args().any(|a| a == "--keychain-selftest") {
+        // Headless probe used after release signing: no window, no LDAP, no existing credential.
+        return match dirlark::profiles::keychain_selftest() {
+            Ok(()) => {
+                println!(
+                    "PASS: native credential store create/read/delete; temporary entry removed"
+                );
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("FAIL: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     dirlark::startup::install();
     if std::env::args().any(|a| a == "--test-startup-dialog") {
         return dirlark::startup::diagnostic_dialog();
