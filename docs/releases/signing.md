@@ -20,6 +20,26 @@ Input: the CI asset `dirlark-<version>-aarch64-apple-darwin.zip` (or an unsigned
 
 **Entitlements: none are needed.** The app is not sandboxed, has no JIT/unsigned-memory/library-validation exceptions, and uses the login keychain through the Security framework. A hardened-runtime build of the app (ad-hoc, `--options runtime`) launched and rendered its window under test. The keychain round trip under the real signature is a post-signing check below; add an entitlement only if that check shows a concrete failure.
 
+## One command per release (`tools/release_sign_local.py`)
+
+```
+python3 tools/release_sign_local.py v0.1.0-alpha.N            # unlock prompt, then everything below
+python3 tools/release_sign_local.py v0.1.0-alpha.N --publish  # same, then makes the draft a public pre-release
+python3 tools/release_sign_local.py v0.1.0-alpha.N --dry-run --assets DIR   # checks only; no keychain, no network
+```
+
+It checks that the release is still a **draft pre-release**, downloads it into a fresh `~/dirlark-release/<tag>/`, verifies `SHA256SUMS` and that the BUILD sidecar's commit is the tag's commit, unlocks the dedicated signing keychain (the system asks for the keychain secret on your terminal; the script never sees it, and locks the keychain again afterwards, also on failure; if the lock cannot be confirmed the run stops with a non-zero status and the exact `security lock-keychain` command to run), and runs `tools/sign_notarize_macos.py`. Then it checks the result: the signed archive has the same files and `Info.plist` as CI's, the executable equals CI's once the signature is removed (a warning, or an error with `--strict-binary`), and `dirlark --keychain-selftest` passes **under the real signature** (use `--skip-selftest` for a tag built before that flag existed). Only then does it replace the macOS zip, its BUILD sidecar and `SHA256SUMS` in the draft, rewrite the signing-status marker in the draft notes with the text from the signed archive, and re-download everything to compare hashes. It re-checks that the release is still a draft right before the first upload and compares the live notes after writing them. If an upload step fails it restores the original assets and notes; if that restore also fails, the run exits non-zero and lists which draft assets and notes may be left modified, with both errors and the manual restore commands. It publishes nothing unless `--publish` is given and every step succeeded; `--publish` is refused together with `--skip-selftest`, and the publish edit passes `--latest=false`. A short human smoke test remains: open the app from Finder and connect over LDAPS to a test directory.
+
+Configuration, names only, in `~/.config/dirlark/signing.toml`:
+
+```
+identity = "Developer ID Application: <name> (<TEAMID>)"
+notary_profile = "dirlark-notary"
+keychain = "/Users/<you>/Library/Keychains/dirlark-signing.keychain-db"   # optional; omit to use the login keychain
+```
+
+Why a dedicated keychain: programs running as your macOS user, coding agents included, can use whatever the login keychain allows. A separate keychain that stays **locked** until you type its secret in the release terminal means nobody else can sign. The script refuses to run for real without an interactive terminal. Create it once (`security create-keychain`, import the Developer ID identity into it, `security set-key-partition-list` for `apple-tool:,apple:,codesign:`), and store the notary credential in it with `xcrun notarytool store-credentials dirlark-notary --keychain <that file> ...` (an App Store Connect API key is preferred over an app-specific password). The manual steps below remain valid and are what the script automates.
+
 ## One-time steps (Johann)
 
 1. **Certificate.** In Xcode (Settings → Accounts → Manage Certificates → + → *Developer ID Application*) or at developer.apple.com → Certificates, create a **Developer ID Application** certificate. It must land in the **login keychain together with its private key**. Check: `security find-identity -v -p codesigning` lists `Developer ID Application: <name> (<TEAMID>)`.
