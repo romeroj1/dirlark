@@ -45,6 +45,8 @@ Enter an authorized server such as `ldaps://directory.example.org:636` and a bas
 
 Profiles store non-secret connection settings only. **Save password in OS keychain** is explicit opt-in: macOS Keychain, Windows Credential Manager or Linux Secret Service. If the service is unavailable, credentials stay session-only; there is no plaintext fallback. Credentials are scoped to profile ID, endpoint and bind DN. The public build uses the separate profile scope `Dirlark-Public` and keychain service `io.github.romeroj1.dirlark`, and does not automatically load private-build profiles or credentials. Do not transfer sensitive profile data into bug reports.
 
+The application can also run the native credential-store probe headlessly: `dirlark --keychain-selftest` prints `PASS` or `FAIL` and exits 0 or 1 without opening a window or contacting a directory. It creates one uniquely named record and removes it, never reads an existing credential and never prints a value. Release tooling runs it against a freshly signed build.
+
 ## Safety and limits
 
 - Changes require preview and explicit Apply; destructive LDIF changes require an additional confirmation. Review the target DN before writing.

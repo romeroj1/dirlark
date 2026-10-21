@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `dirlark --keychain-selftest`: headless create/read/delete probe of the native credential store using one unique temporary record (no window, no directory, no existing credential read). `examples/keyring_smoke` now shares its code.
+
 ## 0.1.0-alpha.4 — prepared, unreleased
 
 Security update, credential-safety fix, icons and optional macOS Developer ID signing. Windows and Linux archives stay unsigned; whether a macOS download is signed is stated only by the release notes' signing-status line for that archive.
