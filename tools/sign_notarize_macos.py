@@ -28,6 +28,7 @@ TARGET = 'aarch64-apple-darwin'
 ARCHIVE = re.compile(r'dirlark-(0\.1\.0-alpha\.[1-9][0-9]{0,2})-' + TARGET + r'\.zip')
 IDENTIFIER = 'io.github.romeroj1.dirlark'
 ENV_IDENTITY, ENV_PROFILE = 'DEVELOPER_ID_APPLICATION', 'NOTARY_PROFILE'
+ENV_KEYCHAIN = 'DIRLARK_SIGNING_KEYCHAIN'   # optional: a dedicated keychain FILE holding the identity and the notary profile
 OFFICIAL_TEAM_ID = '4WH9YXBKP7'      # public in every signed binary; also stated in README/SECURITY.md. Changing it is a reviewed change.
 TOOLS = ('codesign', 'ditto', 'xcrun', 'spctl', 'security')
 MACHO_MAGIC = {bytes.fromhex(h) for h in ('feedface', 'feedfacf', 'cefaedfe', 'cffaedfe', 'cafebabe', 'bebafeca')}
@@ -47,6 +48,8 @@ class Signer:
 
     def __init__(self, env, run=default_run, which=shutil.which, out=print):
         self.env, self.run, self.which, self.out = env, run, which, out
+        self.keychain = env.get(ENV_KEYCHAIN, '').strip()
+        self.keychain_args = ['--keychain', self.keychain] if self.keychain else []
 
     def call(self, command, check=True):
         result = self.run(command)
@@ -73,7 +76,7 @@ class Signer:
             raise SigningError('Missing macOS tools: ' + ', '.join(absent))
 
     def identity_present(self, identity):
-        listing = self.call(['security', 'find-identity', '-v', '-p', 'codesigning']).stdout
+        listing = self.call(['security', 'find-identity', '-v', '-p', 'codesigning'] + ([self.keychain] if self.keychain else [])).stdout
         if identity not in listing:
             raise SigningError('The signing identity is not in the keychain (security find-identity -v -p codesigning)')
         if 'Developer ID Application' not in listing:
@@ -117,7 +120,7 @@ class Signer:
         # Hardened runtime + secure timestamp. No --deep (single binary), no entitlements: the app is not
         # sandboxed, needs no JIT/unsigned memory/library validation exceptions, and uses the legacy login keychain.
         self.call(['codesign', '--force', '--sign', identity, '--options', 'runtime', '--timestamp',
-                   '--identifier', IDENTIFIER, str(app)])
+                   '--identifier', IDENTIFIER] + self.keychain_args + [str(app)])
         team = self.verify_signature(app)
         if team != OFFICIAL_TEAM_ID:
             raise SigningError(f'Signed with Team ID {team}, expected the official {OFFICIAL_TEAM_ID}; nothing was submitted or written')
@@ -127,14 +130,14 @@ class Signer:
         submission = temp / 'notarize-submission.zip'
         self.call(['ditto', '-c', '-k', '--keepParent', str(app), str(submission)])
         result = self.call(['xcrun', 'notarytool', 'submit', str(submission), '--keychain-profile', profile,
-                            '--wait', '--timeout', '30m', '--output-format', 'json'], check=False)
+                            '--wait', '--timeout', '30m', '--output-format', 'json'] + self.keychain_args, check=False)
         try:
             reply = json.loads(result.stdout)
         except json.JSONDecodeError:
             reply = {}
         if result.returncode != 0 or reply.get('status') != 'Accepted':
             if reply.get('id'):
-                log = self.call(['xcrun', 'notarytool', 'log', reply['id'], '--keychain-profile', profile], check=False)
+                log = self.call(['xcrun', 'notarytool', 'log', reply['id'], '--keychain-profile', profile] + self.keychain_args, check=False)
                 self.out(log.stdout.strip())
             raise SigningError(f'Notarization was not accepted (status: {reply.get("status", "unknown")}); nothing was stapled or written')
         return reply['id']

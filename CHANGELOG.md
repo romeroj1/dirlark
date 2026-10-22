@@ -3,6 +3,7 @@
 ## Unreleased
 
 - `dirlark --keychain-selftest`: headless create/read/delete probe of the native credential store using one unique temporary record (no window, no directory, no existing credential read). `examples/keyring_smoke` now shares its code.
+- `tools/release_sign_local.py`: one command that downloads a draft release, signs and notarizes the macOS zip through `tools/sign_notarize_macos.py`, verifies the result and replaces the assets in the draft only (maintainer's Mac; optional dedicated signing keychain via `DIRLARK_SIGNING_KEYCHAIN`). CI is unchanged. A keychain that cannot be confirmed locked, or a failed rollback of the draft, ends the run non-zero with a message saying exactly what to fix.
 
 ## 0.1.0-alpha.4 — prepared, unreleased
 
