@@ -20,17 +20,26 @@ class Repo:
         self.git('config', 'commit.gpgsign', 'false')
         self.git('config', 'core.hooksPath', os.devnull)  # fixtures contain fake key blocks on purpose
 
-    def git(self, *args, email=GOOD, message=None):
-        env = dict(os.environ, GIT_AUTHOR_NAME='A', GIT_AUTHOR_EMAIL=email, GIT_COMMITTER_NAME='A', GIT_COMMITTER_EMAIL=email)
+    def git(self, *args, email=GOOD, name='A', committer_email=None, committer_name=None, message=None):
+        env = dict(
+            os.environ,
+            GIT_AUTHOR_NAME=name,
+            GIT_AUTHOR_EMAIL=email,
+            GIT_COMMITTER_NAME=committer_name or name,
+            GIT_COMMITTER_EMAIL=committer_email or email,
+        )
         return subprocess.run(('git',) + args, cwd=self.root, env=env, check=True, capture_output=True, text=True).stdout
 
-    def commit(self, text='x', email=GOOD, message='change', **files):
-        for name, body in files.items():
-            path = self.root / name.replace('__', '/')
+    def commit(self, text='x', email=GOOD, message='change', name='A', committer_email=None, committer_name=None, **files):
+        for path_name, body in files.items():
+            path = self.root / path_name.replace('__', '/')
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(body)
         self.git('add', '-A')
-        self.git('commit', '-q', '-m', message, email=email)
+        self.git(
+            'commit', '-q', '-m', message,
+            email=email, name=name, committer_email=committer_email, committer_name=committer_name,
+        )
 
     def guard(self, *args, extra=None):
         env = dict(os.environ)
@@ -107,6 +116,46 @@ class PublicGuardTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn('trailer email', result.stderr)
         self.assertIn('message:3: private IPv4', result.stderr)
+
+    def test_dependabot_signoff_is_a_trailer_pair_only(self):
+        self.repo.commit(README='base\n')
+        base = self.repo.git('rev-parse', 'HEAD').strip()
+        self.repo.commit(
+            README='dep\n',
+            email='49699333+dependabot[bot]@users.noreply.github.com',
+            name='dependabot[bot]',
+            committer_email='noreply@github.com',
+            committer_name='GitHub',
+            message='bump\n\nSigned-off-by: dependabot[bot] <support@github.com>\n',
+        )
+        result = self.repo.guard('--base', base)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        base = self.repo.git('rev-parse', 'HEAD').strip()
+        self.repo.commit(README='who\n', message='bump\n\nSigned-off-by: Ada <support@github.com>\n')
+        result = self.repo.guard('--base', base)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('trailer email', result.stderr)
+
+        base = self.repo.git('rev-parse', 'HEAD').strip()
+        self.repo.commit(README='other\n', message='bump\n\nSigned-off-by: Other <other@' + 'example.com>\n')
+        result = self.repo.guard('--base', base)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('trailer email', result.stderr)
+
+        base = self.repo.git('rev-parse', 'HEAD').strip()
+        self.repo.commit(README='person\n', message='bump\n\nCo-authored-by: Ada <ada@' + 'example.org>\n')
+        result = self.repo.guard('--base', base)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('trailer email', result.stderr)
+
+        base = self.repo.git('rev-parse', 'HEAD').strip()
+        self.repo.commit(README='author\n', email='support@github.com', message='plain\n')
+        result = self.repo.guard('--base', base)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('author email is not a GitHub noreply', result.stderr)
+        self.assertIn('committer email', result.stderr)
+        self.assertNotIn('trailer email', result.stderr)
 
     def test_private_denylist_stays_outside_the_repo(self):
         self.repo.commit(README='the word swordfish appears\n')

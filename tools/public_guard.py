@@ -4,6 +4,10 @@ This repository is public and permanent, so the checks are generic and list no r
 internal names. Extra patterns (for example your own domain) can be kept OUTSIDE the
 repository and passed with DIRLARK_GUARD_EXTRA=<file with one regex per line>; the local
 git hook does that, CI cannot. Mark a deliberate example with `public-guard: allow`.
+
+Dependabot signs off as dependabot[bot] <support@github.com>. That pair is accepted
+on a trailer only. The address is not added to the noreply sets, so it still fails
+as an author or committer address.
 """
 import argparse
 import os
@@ -26,8 +30,17 @@ HOME_PATH = re.compile(r'(?:/Users/|/home/|[A-Za-z]:\\Users\\)([^/\\\s"\'`<>$%{}
 FORBIDDEN_PATH = re.compile(r'(?:^|/)(?:\.forgejo|\.env|\.env\..+|.+\.(?:p12|pfx|p8|mobileprovision|keystore|jks))(?:/|$)', re.I)
 NOREPLY = re.compile(r'^(?:\d+\+)?[A-Za-z0-9-]+(?:\[bot\])?@users\.noreply\.github\.com$')
 EXTRA_NOREPLY = {'noreply@github.com', 'noreply@anthropic.com'}
-TRAILER = re.compile(r'^(?:Co-authored-by|Signed-off-by):.*?<([^>]*)>', re.I | re.M)
+# Name and address together. An email-only exception would accept any name at this address.
+DEPENDABOT_SIGNOFF = ('dependabot[bot]', 'support@github.com')
+TRAILER = re.compile(r'^(?:Co-authored-by|Signed-off-by):(.*?)<([^>]*)>', re.I | re.M)
 ALLOW = 'public-guard: allow'
+
+
+def trailer_allowed(name, email):
+    email = email.strip()
+    if NOREPLY.match(email) or email in EXTRA_NOREPLY:
+        return True
+    return (name.strip(), email) == DEPENDABOT_SIGNOFF
 
 
 def git(*args):
@@ -82,8 +95,8 @@ def scan_commits(base, rules):
         for role, email in (('author', ae), ('committer', ce)):
             if not (NOREPLY.match(email) or email in EXTRA_NOREPLY):
                 found.append(f'commit {short}: {role} email is not a GitHub noreply address')
-        for email in TRAILER.findall(body):
-            if not (NOREPLY.match(email) or email in EXTRA_NOREPLY):
+        for name, email in TRAILER.findall(body):
+            if not trailer_allowed(name, email):
                 found.append(f'commit {short}: trailer email is not a noreply address')
         found += scan_text(an + '\n' + cn + '\n' + body, f'commit {short} message', rules)
     return found
