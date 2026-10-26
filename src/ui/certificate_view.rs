@@ -13,6 +13,7 @@ pub(super) struct Viewer {
     pub(super) tab: usize,
     decoded: Result<Vec<Part>, &'static str>,
     raw: String,
+    standalone: Option<Entry>,
 }
 impl Viewer {
     pub fn new(entry: &Entry, attribute: &str, index: usize) -> Option<Self> {
@@ -32,11 +33,28 @@ impl Viewer {
             } else {
                 String::new()
             },
+            standalone: None,
         })
+    }
+    pub fn from_der(der: &[u8]) -> Option<Self> {
+        if der.len() > 64 * 1024 {
+            return None;
+        }
+        let entry = Entry {
+            dn: "cn=server-certificate,dc=connection-security".into(),
+            attrs: [("userCertificate".into(), vec![der.to_vec()])].into(),
+        };
+        let mut viewer = Self::new(&entry, "userCertificate", 0)?;
+        viewer.standalone = Some(entry);
+        Some(viewer)
     }
     /// Current-entry-only inspector. Never reads a directory or retains other entry data.
     pub fn show(&mut self, ctx: &egui::Context, entry: Option<&Entry>) -> bool {
-        let Some(entry) = entry.filter(|e| e.dn == self.dn) else {
+        let standalone = self.standalone.clone();
+        let Some(entry) = standalone
+            .as_ref()
+            .or_else(|| entry.filter(|e| e.dn == self.dn))
+        else {
             return false;
         };
         let Some(values) = entry.attrs.get(&self.attribute) else {

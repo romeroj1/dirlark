@@ -56,6 +56,28 @@ pub struct Part {
     pub certificate: Result<Certificate, &'static str>,
 }
 
+fn validity_bounds(der: &[u8]) -> Option<(i64, i64)> {
+    if der.len() > MAX_CERT || bounded_der(der).is_err() {
+        return None;
+    }
+    let (rest, cert) = X509Certificate::from_der(der).ok()?;
+    if !rest.is_empty() {
+        return None;
+    }
+    Some((
+        cert.validity().not_before.timestamp(),
+        cert.validity().not_after.timestamp(),
+    ))
+}
+/// Return remaining peer certificate lifetime from ASN.1 timestamps after bounded DER preflight.
+pub fn seconds_until_expiry(der: &[u8], now: i64) -> Option<i64> {
+    Some(validity_bounds(der)?.1.saturating_sub(now))
+}
+/// Return seconds until the certificate's notBefore timestamp (negative once valid).
+pub fn seconds_until_validity(der: &[u8], now: i64) -> Option<i64> {
+    Some(validity_bounds(der)?.0.saturating_sub(now))
+}
+
 // Definite-length DER framing, checked before the general-purpose ASN.1 parser.
 // No recursive calls, indefinite lengths, oversized lengths, or high-tag numbers.
 fn take(input: &[u8]) -> Result<(u8, &[u8], &[u8]), &'static str> {
@@ -209,7 +231,9 @@ fn hex(bytes: &[u8]) -> String {
 fn safe(text: String) -> String {
     let mut result = String::new();
     for c in text.chars() {
-        if c.is_control() || matches!(c,'\u{202a}'..='\u{202e}'|'\u{2066}'..='\u{2069}') {
+        if c.is_control()
+            || matches!(c, '\u{061c}' | '\u{200e}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        {
             result.push_str(&format!("\\u{{{:04x}}}", u32::from(c)));
         } else {
             result.push(c);

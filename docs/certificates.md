@@ -14,6 +14,10 @@ Certificate pairs use explicit context tags. S/MIME values follow the certificat
 
 The only new direct dependencies are pinned `x509-parser 0.18.1` (pure-Rust parser, default features disabled) and `ring 0.17.14` (SHA-256 and explicitly labelled legacy SHA-1 fingerprints). Both already existed in the lockfile: no new package or version is added. SHA-1 is used only for a legacy fingerprint, never as a security decision. These exact pins require manual security-version bumps; `cargo audit` remains a required gate for advisories.
 
+## Connection security panel
+
+After an LDAPS attempt, the lock beside the connection status opens the captured TLS details. The app wraps rustls's normal WebPKI verifier using the same system roots plus the selected CA bundle; all certificate, hostname and signature checks are delegated unchanged, and a rejected certificate stays rejected. The panel shows only certificates sent by the server (up to 10 certificates and 64 KiB each), parsed with the same bounded offline certificate parser above. An oversized leaf suppresses chain display; capture stops at the first oversized intermediate. It performs no AIA, CRL or OCSP fetches. Display strings are escaped for control and bidirectional formatting characters. The PEM action writes only captured DER, re-encoded as PEM, with create-new semantics and restrictive permissions where the platform supports them. Expiry under 30 days is amber, computed from certificate timestamps. Cipher suite details are omitted because the LDAP/Tokio Rustls adapter does not expose negotiated connection metadata here.
+
 ## Attribute pane size
 
 Drag the horizontal handle between attributes and the draft editor. Tab focuses the handle; Up/Down changes height by 16 points, Home/End selects a bounded minimum/maximum, and double-click resets to 260 points. The chosen size remains in workspace UI state across entry changes for the current run. Both panes scroll independently and preserve a usable minimum on short viewports. This does not change edit/preview/apply behavior or write confirmation.

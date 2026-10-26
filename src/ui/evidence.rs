@@ -17,6 +17,11 @@ pub const SCENES: &[&str] = &[
     "preview",
     "delete-preview",
     "tls-error",
+    "tls-healthy",
+    "tls-healthy-closed",
+    "tls-expiring",
+    "tls-failed",
+    "tls-900",
     "busy",
     "ldif",
 ];
@@ -255,6 +260,29 @@ pub fn certificate_scene(mut app: Workspace, mut entry: Entry, scene: &str) -> W
     app.selected = Some(entry);
     app
 }
+/// Security-panel evidence uses only supplied synthetic DER and never dispatches network work.
+pub fn connection_security_scene(mut app: Workspace, der: Vec<u8>, scene: &str) -> Workspace {
+    assert!(matches!(
+        scene,
+        "tls-healthy" | "tls-healthy-closed" | "tls-expiring" | "tls-failed" | "tls-900"
+    ));
+    app.tls_capture = Some(crate::tls_observer::Capture {
+        chain: vec![der],
+        failure: (scene == "tls-failed").then_some("Hostname mismatch"),
+        protocol: Some("TLS 1.3"),
+        endpoint_host: "directory.example.test".into(),
+        trust_source: "system trust store".into(),
+    });
+    app.connected = scene != "tls-failed";
+    app.tls_panel_open = scene != "tls-healthy-closed";
+    app.status = if scene == "tls-failed" {
+        "TLS certificate hostname mismatch"
+    } else {
+        "Connected · TLS certificate and hostname verified"
+    }
+    .into();
+    app
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +298,28 @@ mod tests {
         app.send(Request::Read("dc=example,dc=test".into()));
         assert!(!app.busy);
         assert!(app.worker.receiver.try_recv().is_err());
+    }
+    #[test]
+    fn security_fixtures_are_offline_and_carry_only_supplied_synthetic_der() {
+        for scene in [
+            "tls-healthy",
+            "tls-healthy-closed",
+            "tls-expiring",
+            "tls-failed",
+            "tls-900",
+        ] {
+            let app = workspace(
+                egui::Context::default(),
+                "editor",
+                PathBuf::from("unused.png"),
+            );
+            let app = connection_security_scene(app, vec![0x30, 0], scene);
+            assert!(app.path.is_none());
+            assert!(app.password.is_empty());
+            assert_eq!(app.tls_panel_open, scene != "tls-healthy-closed");
+            assert_eq!(app.tls_capture.as_ref().unwrap().chain, vec![vec![0x30, 0]]);
+            assert!(app.worker.receiver.try_recv().is_err());
+            assert_eq!(app.connected, scene != "tls-failed");
+        }
     }
 }

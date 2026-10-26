@@ -132,6 +132,12 @@ impl Drop for Mock {
 }
 impl Mock {
     async fn start(host: &str, expired: bool) -> Self {
+        Self::start_with_validity(host, expired, false).await
+    }
+    async fn start_not_yet_valid(host: &str) -> Self {
+        Self::start_with_validity(host, false, true).await
+    }
+    async fn start_with_validity(host: &str, expired: bool, not_yet_valid: bool) -> Self {
         let mut ca = CertificateParams::new(vec![]).unwrap();
         ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         let ca_key = KeyPair::generate().unwrap();
@@ -140,6 +146,9 @@ impl Mock {
         if expired {
             leaf.not_before = rcgen::date_time_ymd(2000, 1, 1);
             leaf.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        } else if not_yet_valid {
+            leaf.not_before = rcgen::date_time_ymd(2035, 1, 1);
+            leaf.not_after = rcgen::date_time_ymd(2036, 1, 1);
         }
         let leaf_key = KeyPair::generate().unwrap();
         let issuer = Issuer::from_params(&ca, &ca_key);
@@ -501,7 +510,30 @@ fn ldaps_protocol_read_write_schema_and_unbind() {
     runtime().block_on(async {
         tokio::time::timeout(Duration::from_secs(10), async {
             let server = Mock::start("localhost", false).await;
-            let mut client = Directory::connect(&server.profile, "").await.unwrap();
+            let (mut client, capture) = Directory::connect_observed(&server.profile, "")
+                .await
+                .unwrap();
+            assert_eq!(capture.failure, None);
+            assert_eq!(capture.endpoint_host, "localhost");
+            assert!(
+                capture
+                    .trust_source
+                    .starts_with("system trust store + CA bundle")
+            );
+            assert!(!capture.chain.is_empty());
+            assert!(matches!(capture.protocol, Some("TLS 1.2" | "TLS 1.3")));
+            let leaf = dirlark::certificates::inspect(
+                &capture.chain[0],
+                dirlark::certificates::Kind::Certificate,
+                x509_parser::time::ASN1Time::now().timestamp(),
+            )
+            .unwrap();
+            let fields = &leaf[0].certificate.as_ref().unwrap().fields;
+            assert!(
+                fields
+                    .iter()
+                    .any(|(name, value)| name.starts_with("SAN ") && value.contains("localhost"))
+            );
             let root = client.read("").await.unwrap();
             assert_eq!(root.values("namingContexts"), vec!["dc=example"]);
             let found = client
@@ -634,21 +666,33 @@ fn tls_rejects_unknown_ca_wrong_host_and_expired_certificate() {
         let server = Mock::start("localhost", false).await;
         let mut unknown = server.profile.clone();
         unknown.ca_bundle.clear();
-        let unknown_err = Directory::connect(&unknown, "").await.err().unwrap();
+        let (unknown_err, unknown_capture) = Directory::connect_observed(&unknown, "")
+            .await
+            .err()
+            .unwrap();
         assert!(
             unknown_err.contains("unknown CA") || unknown_err.contains("not trusted"),
             "unexpected unknown CA error: {unknown_err}"
         );
+        assert_eq!(unknown_capture.failure, Some("Untrusted issuer"));
+        assert_eq!(unknown_capture.endpoint_host, "localhost");
+        assert_eq!(unknown_capture.trust_source, "system trust store");
+        assert!(!unknown_capture.chain.is_empty());
         assert!(server.operations.lock().unwrap().is_empty());
         let wrong = Mock::start("wrong.example", false).await;
-        let wrong_err = Directory::connect(&wrong.profile, "").await.err().unwrap();
+        let (wrong_err, wrong_capture) = Directory::connect_observed(&wrong.profile, "")
+            .await
+            .err()
+            .unwrap();
         assert!(
             wrong_err.contains("hostname mismatch") && wrong_err.contains("localhost"),
             "unexpected wrong host error: {wrong_err}"
         );
+        assert_eq!(wrong_capture.failure, Some("Hostname mismatch"));
+        assert!(!wrong_capture.chain.is_empty());
         assert!(wrong.operations.lock().unwrap().is_empty());
         let expired = Mock::start("localhost", true).await;
-        let expired_err = Directory::connect(&expired.profile, "")
+        let (expired_err, expired_capture) = Directory::connect_observed(&expired.profile, "")
             .await
             .err()
             .unwrap();
@@ -656,7 +700,21 @@ fn tls_rejects_unknown_ca_wrong_host_and_expired_certificate() {
             expired_err.contains("expired"),
             "unexpected expired cert error: {expired_err}"
         );
+        assert_eq!(expired_capture.failure, Some("Expired"));
+        assert!(!expired_capture.chain.is_empty());
         assert!(expired.operations.lock().unwrap().is_empty());
+        let future = Mock::start_not_yet_valid("localhost").await;
+        let (future_err, future_capture) = Directory::connect_observed(&future.profile, "")
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            future_err.contains("not yet valid"),
+            "unexpected future cert error: {future_err}"
+        );
+        assert_eq!(future_capture.failure, Some("Not yet valid"));
+        assert!(!future_capture.chain.is_empty());
+        assert!(future.operations.lock().unwrap().is_empty());
     });
 }
 #[test]
