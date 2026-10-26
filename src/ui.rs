@@ -32,7 +32,7 @@ fn one_line(value: &str) -> String {
         .chars()
         .take(160)
         .map(|ch| {
-            if ch.is_control() || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
+            if ch.is_control() || matches!(ch, '\u{061c}' | '\u{200e}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
                 '\u{fffd}'
             } else {
                 ch
@@ -47,28 +47,20 @@ enum SecurityTone {
     Expiring,
     Failed,
 }
-fn security_tone(failed: bool, days_left: Option<i64>) -> SecurityTone {
+fn security_tone(failed: bool, seconds_left: Option<i64>) -> SecurityTone {
     if failed {
         SecurityTone::Failed
-    } else if days_left.is_some_and(|days| days < 30) {
+    } else if seconds_left.is_some_and(|seconds| seconds < 30 * 86_400) {
         SecurityTone::Expiring
     } else {
         SecurityTone::Verified
     }
 }
-fn certificate_days_left(der: &[u8], now: i64) -> Option<i64> {
-    let parts =
-        crate::certificates::inspect(der, crate::certificates::Kind::Certificate, now).ok()?;
-    let cert = parts.first()?.certificate.as_ref().ok()?;
-    cert.fields
-        .iter()
-        .find(|(name, _)| name == "Validity status")?
-        .1
-        .strip_prefix("Expires in ")?
-        .split_whitespace()
-        .next()?
-        .parse()
+fn endpoint_host_label(endpoint: &str) -> String {
+    url::Url::parse(endpoint)
         .ok()
+        .and_then(|url| url.host_str().map(one_line))
+        .unwrap_or_else(|| "server".into())
 }
 fn pem_chain(chain: &[Vec<u8>]) -> String {
     let mut pem = String::new();
@@ -120,6 +112,7 @@ pub struct Workspace {
     tls_panel_open: bool,
     tls_selected: usize,
     tls_pem_path: String,
+    tls_pem_path_focused: bool,
     attributes_height: f32,
     base: String,
     filter: String,
@@ -281,6 +274,7 @@ impl Workspace {
             tls_panel_open: false,
             tls_selected: 0,
             tls_pem_path: String::new(),
+            tls_pem_path_focused: false,
             attributes_height: DEFAULT_ATTRIBUTES_HEIGHT,
             filter: "(objectClass=*)".into(),
             attrs: "*".into(),
@@ -508,14 +502,8 @@ impl Workspace {
                 self.connecting_saves_or_uses_keychain = false;
                 self.note("Connected · TLS certificate and hostname verified".into());
             }
-            Response::ConnectFailed(message, mut capture) => {
-                if capture.failure.is_none()
-                    && !capture.chain.is_empty()
-                    && (message.starts_with("TLS certificate")
-                        || message.starts_with("TLS handshake"))
-                {
-                    capture.failure = Some("Other verification failure");
-                }
+            Response::ConnectFailed(message, capture) => {
+                self.connecting_saves_or_uses_keychain = false;
                 self.tls_capture = Some(capture);
                 self.tls_panel_open = true;
                 self.note(message);
@@ -1358,9 +1346,13 @@ impl Workspace {
     fn security_lock(&mut self, ui: &mut egui::Ui) {
         let capture = self.tls_capture.as_ref();
         let failure = capture.and_then(|c| c.failure);
-        let days = capture.and_then(|c| c.chain.first()).and_then(|der| {
-            certificate_days_left(der, x509_parser::time::ASN1Time::now().timestamp())
+        let seconds = capture.and_then(|c| c.chain.first()).and_then(|der| {
+            crate::certificates::seconds_until_expiry(
+                der,
+                x509_parser::time::ASN1Time::now().timestamp(),
+            )
         });
+        let days = seconds.map(|seconds| (seconds / 86_400).max(0));
         let label = if let Some(reason) = failure {
             format!("TLS refused · {reason}")
         } else if let Some(days) = days.filter(|d| *d < 30) {
@@ -1368,7 +1360,7 @@ impl Workspace {
         } else {
             "Connected · TLS verified".into()
         };
-        let tone = security_tone(failure.is_some(), days);
+        let tone = security_tone(failure.is_some(), seconds);
         let color = match tone {
             SecurityTone::Failed => theme::colors(ui).error,
             SecurityTone::Expiring => theme::colors(ui).warning,
@@ -1383,7 +1375,7 @@ impl Workspace {
         }
     }
     fn tls_panel(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !self.tls_pem_path_focused {
             self.tls_panel_open = false;
         }
         if !self.tls_panel_open {
@@ -1395,25 +1387,32 @@ impl Workspace {
         };
         let mut open = true;
         egui::Window::new("Connection security").open(&mut open).default_width(470.0).resizable(true).show(ctx, |ui| {
+            egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 120.0).max(220.0)).show(ui, |ui| {
             if let Some(reason) = capture.failure {
                 ui.colored_label(theme::colors(ui).error, format!("Connection refused · {reason}"));
             } else if capture.chain.is_empty() {
                 ui.heading("No TLS certificate captured");
             } else {
-                ui.heading("Connection verified");
+                let seconds = capture.chain.first().and_then(|der| crate::certificates::seconds_until_expiry(der, x509_parser::time::ASN1Time::now().timestamp()));
+                if security_tone(false, seconds) == SecurityTone::Expiring {
+                    let days = seconds.map(|seconds| (seconds / 86_400).max(0)).unwrap_or(0);
+                    ui.colored_label(theme::colors(ui).warning, format!("Connection verified · certificate expires in {days} days"));
+                } else {
+                    ui.heading("Connection verified");
+                }
             }
             ui.label(format!("Protocol: {}", capture.protocol.unwrap_or("Negotiated TLS")));
-            let host = self.profile.endpoint.split("://").nth(1).unwrap_or("server").split([':', '/']).next().unwrap_or("server");
+            let host = endpoint_host_label(&self.profile.endpoint);
             let host_result = if capture.failure.is_some() { " · mismatch or unverified" } else if capture.chain.is_empty() { " · not verified" } else { " · matches certificate" };
-            ui.label(format!("Hostname: {}{}", one_line(host), host_result));
-            ui.label(format!("Trust: {}", if self.profile.ca_bundle.trim().is_empty() { "system trust store".to_owned() } else { format!("selected CA bundle · {}", one_line(std::path::Path::new(&self.profile.ca_bundle).file_name().and_then(|n| n.to_str()).unwrap_or("CA bundle"))) }));
+            ui.label(format!("Hostname: {host}{host_result}"));
+            ui.label(format!("Trust: {}", if self.profile.ca_bundle.trim().is_empty() { "system trust store".to_owned() } else { format!("system trust store + CA bundle · {}", one_line(std::path::Path::new(&self.profile.ca_bundle).file_name().and_then(|n| n.to_str()).unwrap_or("CA bundle"))) }));
             ui.separator();
             ui.strong("Certificate chain sent by server");
             if capture.chain.is_empty() { ui.label("No certificate was received."); }
             for (index, der) in capture.chain.iter().take(10).enumerate() {
                 let parts = crate::certificates::inspect(der, crate::certificates::Kind::Certificate, x509_parser::time::ASN1Time::now().timestamp());
                 let label = parts.as_ref().ok().and_then(|p| p.first()).and_then(|p| p.certificate.as_ref().ok()).and_then(|c| c.fields.iter().find(|(k,_)| k == "Subject").map(|(_,v)| v.clone())).unwrap_or_else(|| format!("Certificate {} · malformed", index + 1));
-                if ui.selectable_label(self.tls_selected == index, format!("{}{}", if index == 0 { "Server certificate · " } else { "Certificate · " }, label)).clicked() { self.tls_selected = index; }
+                if ui.selectable_label(self.tls_selected == index, format!("{}{}", if index == 0 { "Server certificate · " } else { "Certificate · " }, one_line(&label))).clicked() { self.tls_selected = index; }
             }
             if let Some(der) = capture.chain.get(self.tls_selected.min(capture.chain.len().saturating_sub(1))) {
                 if let Ok(parts) = crate::certificates::inspect(der, crate::certificates::Kind::Certificate, x509_parser::time::ASN1Time::now().timestamp()) {
@@ -1427,15 +1426,21 @@ impl Workspace {
                 } else { ui.label("Certificate could not be decoded safely."); }
             }
             ui.horizontal(|ui| {
-                ui.label("Save chain as PEM"); ui.text_edit_singleline(&mut self.tls_pem_path);
-                if ui.button("Save…").clicked() { self.save_tls_chain(&capture.chain); }
+                ui.label("Save chain as PEM");
+                self.tls_pem_path_focused = ui.text_edit_singleline(&mut self.tls_pem_path).has_focus();
+                if ui.add_enabled(!capture.chain.is_empty(), egui::Button::new("Save…")).clicked() { self.save_tls_chain(&capture.chain); }
             });
             ui.label("Display only. Trust and hostname verification remain mandatory; this panel never changes trust.");
+            });
         });
         self.tls_panel_open = open;
     }
     fn save_tls_chain(&mut self, chain: &[Vec<u8>]) {
         use std::io::Write;
+        if chain.is_empty() {
+            self.note("No server certificate was captured; nothing to save".into());
+            return;
+        }
         let path = match crate::model::expand_local_path(&self.tls_pem_path) {
             Ok(path) => path,
             Err(msg) => {
@@ -1451,10 +1456,15 @@ impl Workspace {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        match options
-            .open(path)
-            .and_then(|mut f| f.write_all(pem.as_bytes()))
-        {
+        let result = options.open(&path).and_then(|mut file| {
+            if let Err(error) = file.write_all(pem.as_bytes()) {
+                drop(file);
+                let _ = std::fs::remove_file(&path);
+                return Err(error);
+            }
+            Ok(())
+        });
+        match result {
             Ok(()) => self.note("Server-sent certificate chain saved as PEM".into()),
             Err(_) => self.note("Could not save PEM chain; choose a new writable file path".into()),
         }
@@ -2874,7 +2884,7 @@ fn attributes_splitter(ui: &mut egui::Ui, desired: &mut f32, available: f32) -> 
 mod tests {
     use super::*;
     #[test]
-    fn security_panel_expiry_threshold_uses_injected_clock() {
+    fn security_panel_expiry_threshold_uses_exact_timestamps_and_injected_clock() {
         let now = rcgen::date_time_ymd(2026, 1, 3).unix_timestamp();
         let cert = |month, day| {
             let mut params =
@@ -2887,17 +2897,55 @@ mod tests {
                 .der()
                 .to_vec()
         };
-        assert_eq!(certificate_days_left(&cert(2, 1), now), Some(29));
+        let seconds29 = crate::certificates::seconds_until_expiry(&cert(2, 1), now);
+        assert_eq!(seconds29, Some(29 * 86_400));
+        assert_eq!(security_tone(false, seconds29), SecurityTone::Expiring);
+        let seconds31 = crate::certificates::seconds_until_expiry(&cert(2, 3), now);
+        assert_eq!(seconds31, Some(31 * 86_400));
+        assert_eq!(security_tone(false, seconds31), SecurityTone::Verified);
         assert_eq!(
-            security_tone(false, certificate_days_left(&cert(2, 1), now)),
+            security_tone(false, Some(30 * 86_400 - 1)),
             SecurityTone::Expiring
         );
-        assert_eq!(certificate_days_left(&cert(2, 3), now), Some(31));
         assert_eq!(
-            security_tone(false, certificate_days_left(&cert(2, 3), now)),
+            security_tone(false, Some(30 * 86_400)),
             SecurityTone::Verified
         );
-        assert_eq!(security_tone(true, Some(29)), SecurityTone::Failed);
+        assert_eq!(security_tone(true, Some(29 * 86_400)), SecurityTone::Failed);
+    }
+    #[test]
+    fn hostile_endpoint_labels_are_one_line_and_preserve_ipv6_host() {
+        assert_eq!(
+            endpoint_host_label("ldaps://[2001:db8::1]:636"),
+            "[2001:db8::1]"
+        );
+        assert_eq!(
+            one_line("a\u{200e}b\u{2028}c\u{061c}d"),
+            "a\u{fffd}b\u{fffd}c\u{fffd}d"
+        );
+    }
+    #[test]
+    fn connect_failed_response_stores_fixed_security_capture_and_resets_keychain_state() {
+        let mut workspace = Workspace::from_path(egui::Context::default(), None, None, false);
+        workspace.connecting_saves_or_uses_keychain = true;
+        workspace.accept_response(
+            workspace.generation,
+            Response::ConnectFailed(
+                "TLS certificate hostname mismatch".into(),
+                crate::tls_observer::Capture {
+                    chain: vec![vec![0x30, 0]],
+                    failure: Some("Hostname mismatch"),
+                    protocol: Some("TLS 1.3"),
+                },
+            ),
+        );
+        assert!(!workspace.connecting_saves_or_uses_keychain);
+        assert!(workspace.tls_panel_open);
+        assert_eq!(
+            workspace.tls_capture.as_ref().unwrap().failure,
+            Some("Hostname mismatch")
+        );
+        assert_eq!(workspace.status, "TLS certificate hostname mismatch");
     }
     #[test]
     fn pem_export_round_trips_captured_der_and_caps_the_chain() {

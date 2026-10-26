@@ -27,7 +27,9 @@ fn main() -> eframe::Result {
         "certificate_evidence SCENE dark|light OUTPUT ZOOM"
     );
     let scene = args[1].clone();
-    let dimensions = if scene == "compact" {
+    let dimensions = if scene == "tls-900" {
+        [900.0, 900.0]
+    } else if scene == "compact" {
         [900.0, 700.0]
     } else {
         [1280.0, 900.0]
@@ -80,7 +82,7 @@ fn main() -> eframe::Result {
             let app = evidence::workspace(cc.egui_ctx.clone(), "editor", path);
             if matches!(
                 scene.as_str(),
-                "tls-healthy" | "tls-expiring" | "tls-failed"
+                "tls-healthy" | "tls-healthy-closed" | "tls-expiring" | "tls-failed" | "tls-900"
             ) {
                 Ok(Box::new(evidence::connection_security_scene(
                     app,

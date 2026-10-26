@@ -132,6 +132,12 @@ impl Drop for Mock {
 }
 impl Mock {
     async fn start(host: &str, expired: bool) -> Self {
+        Self::start_with_validity(host, expired, false).await
+    }
+    async fn start_not_yet_valid(host: &str) -> Self {
+        Self::start_with_validity(host, false, true).await
+    }
+    async fn start_with_validity(host: &str, expired: bool, not_yet_valid: bool) -> Self {
         let mut ca = CertificateParams::new(vec![]).unwrap();
         ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         let ca_key = KeyPair::generate().unwrap();
@@ -140,6 +146,9 @@ impl Mock {
         if expired {
             leaf.not_before = rcgen::date_time_ymd(2000, 1, 1);
             leaf.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        } else if not_yet_valid {
+            leaf.not_before = rcgen::date_time_ymd(2035, 1, 1);
+            leaf.not_after = rcgen::date_time_ymd(2036, 1, 1);
         }
         let leaf_key = KeyPair::generate().unwrap();
         let issuer = Issuer::from_params(&ca, &ca_key);
@@ -686,6 +695,18 @@ fn tls_rejects_unknown_ca_wrong_host_and_expired_certificate() {
         assert_eq!(expired_capture.failure, Some("Expired"));
         assert!(!expired_capture.chain.is_empty());
         assert!(expired.operations.lock().unwrap().is_empty());
+        let future = Mock::start_not_yet_valid("localhost").await;
+        let (future_err, future_capture) = Directory::connect_observed(&future.profile, "")
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            future_err.contains("not yet valid"),
+            "unexpected future cert error: {future_err}"
+        );
+        assert_eq!(future_capture.failure, Some("Not yet valid"));
+        assert!(!future_capture.chain.is_empty());
+        assert!(future.operations.lock().unwrap().is_empty());
     });
 }
 #[test]

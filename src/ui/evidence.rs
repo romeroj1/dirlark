@@ -18,8 +18,10 @@ pub const SCENES: &[&str] = &[
     "delete-preview",
     "tls-error",
     "tls-healthy",
+    "tls-healthy-closed",
     "tls-expiring",
     "tls-failed",
+    "tls-900",
     "busy",
     "ldif",
 ];
@@ -262,7 +264,7 @@ pub fn certificate_scene(mut app: Workspace, mut entry: Entry, scene: &str) -> W
 pub fn connection_security_scene(mut app: Workspace, der: Vec<u8>, scene: &str) -> Workspace {
     assert!(matches!(
         scene,
-        "tls-healthy" | "tls-expiring" | "tls-failed"
+        "tls-healthy" | "tls-healthy-closed" | "tls-expiring" | "tls-failed" | "tls-900"
     ));
     app.tls_capture = Some(crate::tls_observer::Capture {
         chain: vec![der],
@@ -270,7 +272,7 @@ pub fn connection_security_scene(mut app: Workspace, der: Vec<u8>, scene: &str) 
         protocol: Some("TLS 1.3"),
     });
     app.connected = scene != "tls-failed";
-    app.tls_panel_open = true;
+    app.tls_panel_open = scene != "tls-healthy-closed";
     app.status = if scene == "tls-failed" {
         "TLS certificate hostname mismatch"
     } else {
@@ -297,7 +299,13 @@ mod tests {
     }
     #[test]
     fn security_fixtures_are_offline_and_carry_only_supplied_synthetic_der() {
-        for scene in ["tls-healthy", "tls-expiring", "tls-failed"] {
+        for scene in [
+            "tls-healthy",
+            "tls-healthy-closed",
+            "tls-expiring",
+            "tls-failed",
+            "tls-900",
+        ] {
             let app = workspace(
                 egui::Context::default(),
                 "editor",
@@ -306,7 +314,7 @@ mod tests {
             let app = connection_security_scene(app, vec![0x30, 0], scene);
             assert!(app.path.is_none());
             assert!(app.password.is_empty());
-            assert!(app.tls_panel_open);
+            assert_eq!(app.tls_panel_open, scene != "tls-healthy-closed");
             assert_eq!(app.tls_capture.as_ref().unwrap().chain, vec![vec![0x30, 0]]);
             assert!(app.worker.receiver.try_recv().is_err());
             assert_eq!(app.connected, scene != "tls-failed");

@@ -23,10 +23,11 @@ struct ObservingVerifier {
     slot: Slot,
 }
 fn captured_chain(end: &CertificateDer<'_>, intermediates: &[CertificateDer<'_>]) -> Vec<Vec<u8>> {
-    let mut chain = Vec::new();
-    if end.as_ref().len() <= 64 * 1024 {
-        chain.push(end.as_ref().to_vec());
+    if end.as_ref().len() > 64 * 1024 {
+        return Vec::new();
     }
+    let mut chain = Vec::new();
+    chain.push(end.as_ref().to_vec());
     for cert in intermediates.iter().take(9) {
         if cert.as_ref().len() > 64 * 1024 {
             break;
@@ -65,7 +66,13 @@ impl ServerCertVerifier for ObservingVerifier {
         if let Ok(mut state) = self.slot.lock() {
             state.protocol = Some("TLS 1.2");
         }
-        self.delegate.verify_tls12_signature(message, cert, dss)
+        let result = self.delegate.verify_tls12_signature(message, cert, dss);
+        if let Err(error) = &result
+            && let Ok(mut state) = self.slot.lock()
+        {
+            state.failure = Some(failure_reason(error));
+        }
+        result
     }
     fn verify_tls13_signature(
         &self,
@@ -76,7 +83,13 @@ impl ServerCertVerifier for ObservingVerifier {
         if let Ok(mut state) = self.slot.lock() {
             state.protocol = Some("TLS 1.3");
         }
-        self.delegate.verify_tls13_signature(message, cert, dss)
+        let result = self.delegate.verify_tls13_signature(message, cert, dss);
+        if let Err(error) = &result
+            && let Ok(mut state) = self.slot.lock()
+        {
+            state.failure = Some(failure_reason(error));
+        }
+        result
     }
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.delegate.supported_verify_schemes()
@@ -126,5 +139,7 @@ mod tests {
         let chain = captured_chain(&end, &intermediates);
         assert_eq!(chain.len(), 5);
         assert!(chain.iter().all(|der| der.len() <= 64 * 1024));
+        let oversized_leaf = CertificateDer::from(vec![0; 64 * 1024 + 1]);
+        assert!(captured_chain(&oversized_leaf, &intermediates).is_empty());
     }
 }
