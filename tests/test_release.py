@@ -30,6 +30,15 @@ class Release(unittest.TestCase):
         self.assertEqual(build['permissions'], {'contents': 'read'})
         self.assertEqual(publish['permissions'], {'contents': 'write'})
         self.assertEqual(publish['needs'], ['build'])
+        upload = next(step for step in build['steps'] if step.get('name') == 'Upload this run only')
+        self.assertEqual(upload['uses'], 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9')
+        self.assertEqual(upload['with']['name'], 'alpha-${{ matrix.platform }}')
+        self.assertEqual(upload['with']['path'], 'release-out/*')
+        self.assertEqual(upload['with']['retention-days'], 7)
+        self.assertNotIn('archive', upload['with'])  # default archive keeps each multi-file platform set together
+        download = next(step for step in publish['steps'] if step.get('uses', '').startswith('actions/download-artifact@'))
+        self.assertEqual(download['uses'], 'actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333')
+        self.assertEqual(download['with'], {'pattern': 'alpha-*', 'path': 'release-downloads', 'merge-multiple': False})
         self.assertEqual(build['strategy']['max-parallel'], 2)
         self.assertEqual({m['os'] for m in build['strategy']['matrix']['include']}, {'windows-2025', 'macos-15', 'ubuntu-24.04'})
         for job in (build, publish):

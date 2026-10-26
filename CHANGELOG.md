@@ -2,10 +2,17 @@
 
 ## Unreleased
 
-- `dirlark --keychain-selftest`: headless create/read/delete probe of the native credential store using one unique temporary record (no window, no directory, no existing credential read). `examples/keyring_smoke` now shares its code.
 - `tools/release_sign_local.py`: one command that downloads a draft release, signs and notarizes the macOS zip through `tools/sign_notarize_macos.py`, verifies the result and replaces the assets in the draft only (maintainer's Mac; optional dedicated signing keychain via `DIRLARK_SIGNING_KEYCHAIN`). CI is unchanged. A keychain that cannot be confirmed locked, or a failed rollback of the draft, ends the run non-zero with a message saying exactly what to fix.
 
-## 0.1.0-alpha.4 — prepared, unreleased
+## 0.1.0-alpha.5 — prepared
+
+Display-only TLS connection evidence, a native credential-store self-test and a Tokio dependency update. See [alpha.5 notes](docs/releases/0.1.0-alpha.5.md) for release limits and signing status.
+
+- Added a display-only TLS security panel showing captured connection protocol and peer-certificate evidence, with PEM export. TLS verification remains mandatory; the panel does not validate or change trust.
+- Added `dirlark --keychain-selftest`, a headless create/read/delete probe of the native credential store using one unique temporary record (no window, no directory, no existing credential read). `examples/keyring_smoke` now shares its code.
+- Updated Tokio from 1.53.3 to 1.54.1.
+
+## 0.1.0-alpha.4 — published 2026-10-21
 
 Security update, credential-safety fix, icons and optional macOS Developer ID signing. Windows and Linux archives stay unsigned; whether a macOS download is signed is stated only by the release notes' signing-status line for that archive.
 

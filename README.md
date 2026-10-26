@@ -4,15 +4,15 @@
 ![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![Rust 1.97.1](https://img.shields.io/badge/Rust-1.97.1-orange)
 
-DIRLARK is a native Rust LDAP browser/editor for macOS, Linux and Windows. Browse lazily, search with bounded paging, inspect and edit entries, preview changes, import/export LDIF and browse schema. Public certificate attributes have a local, display-only viewer. This is an early development snapshot; no signed release or installer is provided.
+DIRLARK is a native Rust LDAP browser/editor for macOS, Linux and Windows. Browse lazily, search with bounded paging, inspect and edit entries, preview changes, import/export LDIF and browse schema. Public certificate attributes have a local, display-only viewer. This is an early development snapshot; the alpha.4 macOS release is Developer ID signed and notarized, while Windows and Linux releases are unsigned. No installer is provided.
 
 Inspired by Apache Directory Studio; not affiliated with or endorsed by the Apache Software Foundation. This is original Rust code: no Apache/Eclipse implementation, icons or branding are included. See [NOTICE](NOTICE) and [provenance](docs/provenance.md).
 
 ## Pre-release downloads and installation
 
-The **0.1.0-alpha.4** release is being prepared; a changelog entry does not mean a download exists. Approved public binaries will be on [GitHub Releases](https://github.com/romeroj1/dirlark/releases), marked pre-release, with SHA256SUMS. No installer or DMG is provided and no admin privileges are required. [Alpha limitations](docs/releases/0.1.0-alpha.4.md) · [Changelog](CHANGELOG.md).
+The **0.1.0-alpha.5** release is being prepared. Once approved and published, its pre-release downloads and SHA256SUMS will be on [GitHub Releases](https://github.com/romeroj1/dirlark/releases). No installer or DMG is provided and no admin privileges are required. [Alpha.5 notes and limitations](docs/releases/0.1.0-alpha.5.md) · [Changelog](CHANGELOG.md).
 
-| Platform | Planned download | Runtime evidence / limits |
+| Platform | Download | Runtime evidence / limits |
 |---|---|---|
 | Windows x64 | ZIP, native MSVC build | Earlier no-GPU VM: anonymous verified LDAPS and certificate viewer confirmed; real-GPU/high-DPI/Credential Manager untested |
 | macOS arm64 | ZIP containing DIRLARK.app | Earlier Apple Silicon runtime confirmed; broader Keychain/managed-Mac flows untested |
