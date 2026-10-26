@@ -25,6 +25,12 @@ fn endpoint_host(endpoint: &str) -> String {
         .and_then(|u| u.host_str().map(String::from))
         .unwrap_or_else(|| endpoint.into())
 }
+pub fn capture_host(endpoint: &str) -> String {
+    url::Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "server".into())
+}
 pub fn connect_error(err: &ldap3::LdapError, endpoint: &str) -> String {
     let host = endpoint_host(endpoint);
     let combined = format!("{err} {err:?}");
@@ -178,6 +184,22 @@ pub fn tls_config(
     .with_no_client_auth();
     Ok((Arc::new(config), slot))
 }
+fn capture_for_profile(
+    profile: &Profile,
+    mut capture: crate::tls_observer::Capture,
+) -> crate::tls_observer::Capture {
+    capture.endpoint_host = capture_host(&profile.endpoint);
+    capture.trust_source = if profile.ca_bundle.trim().is_empty() {
+        "system trust store".into()
+    } else {
+        let name = std::path::Path::new(&profile.ca_bundle)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("CA bundle");
+        format!("system trust store + CA bundle · {name}")
+    };
+    capture
+}
 pub struct Directory {
     ldap: Ldap,
     driver: tokio::task::JoinHandle<()>,
@@ -202,15 +224,16 @@ impl Directory {
         profile: &Profile,
         password: &str,
     ) -> Result<(Self, crate::tls_observer::Capture), (String, crate::tls_observer::Capture)> {
-        let (config, slot) = tls_config(&profile.ca_bundle).map_err(|e| (e, Default::default()))?;
+        let (config, slot) = tls_config(&profile.ca_bundle)
+            .map_err(|e| (e, capture_for_profile(profile, Default::default())))?;
         match Self::connect_with_config(profile, password, config).await {
             Ok(directory) => {
                 let capture = slot.lock().map(|value| value.clone()).unwrap_or_default();
-                Ok((directory, capture))
+                Ok((directory, capture_for_profile(profile, capture)))
             }
             Err(error) => {
                 let capture = slot.lock().map(|value| value.clone()).unwrap_or_default();
-                Err((error, capture))
+                Err((error, capture_for_profile(profile, capture)))
             }
         }
     }

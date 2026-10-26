@@ -270,6 +270,8 @@ pub fn connection_security_scene(mut app: Workspace, der: Vec<u8>, scene: &str) 
         chain: vec![der],
         failure: (scene == "tls-failed").then_some("Hostname mismatch"),
         protocol: Some("TLS 1.3"),
+        endpoint_host: "directory.example.test".into(),
+        trust_source: "system trust store".into(),
     });
     app.connected = scene != "tls-failed";
     app.tls_panel_open = scene != "tls-healthy-closed";

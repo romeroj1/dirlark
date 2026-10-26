@@ -14,6 +14,8 @@ pub struct Capture {
     pub chain: Vec<Vec<u8>>,
     pub failure: Option<&'static str>,
     pub protocol: Option<&'static str>,
+    pub endpoint_host: String,
+    pub trust_source: String,
 }
 pub type Slot = Arc<Mutex<Capture>>;
 
@@ -48,6 +50,8 @@ impl ServerCertVerifier for ObservingVerifier {
         // Record only bounded DER bytes. The delegate remains the sole source of trust decisions.
         if let Ok(mut state) = self.slot.lock() {
             state.chain = captured_chain(end, intermediates);
+            state.failure = None;
+            state.protocol = None;
         }
         let result = self
             .delegate
@@ -100,17 +104,19 @@ impl ServerCertVerifier for ObservingVerifier {
 }
 
 fn failure_reason(error: &Error) -> &'static str {
-    let text = format!("{error:?}").to_ascii_lowercase();
-    if text.contains("unknownissuer") || text.contains("unknown issuer") {
-        "Untrusted issuer"
-    } else if text.contains("notvalidforname") || text.contains("not valid for") {
-        "Hostname mismatch"
-    } else if text.contains("expired") {
-        "Expired"
-    } else if text.contains("notvalidyet") || text.contains("not valid yet") {
-        "Not yet valid"
-    } else {
-        "Other verification failure"
+    match error {
+        Error::InvalidCertificate(error) => match error {
+            rustls::CertificateError::UnknownIssuer => "Untrusted issuer",
+            rustls::CertificateError::NotValidForName
+            | rustls::CertificateError::NotValidForNameContext { .. } => "Hostname mismatch",
+            rustls::CertificateError::Expired | rustls::CertificateError::ExpiredContext { .. } => {
+                "Expired"
+            }
+            rustls::CertificateError::NotValidYet
+            | rustls::CertificateError::NotValidYetContext { .. } => "Not yet valid",
+            _ => "Other verification failure",
+        },
+        _ => "Other verification failure",
     }
 }
 
@@ -141,5 +147,31 @@ mod tests {
         assert!(chain.iter().all(|der| der.len() <= 64 * 1024));
         let oversized_leaf = CertificateDer::from(vec![0; 64 * 1024 + 1]);
         assert!(captured_chain(&oversized_leaf, &intermediates).is_empty());
+    }
+    #[test]
+    fn fixed_reason_uses_typed_rustls_error_not_presented_name_text() {
+        use rustls::CertificateError;
+        assert_eq!(
+            failure_reason(&Error::InvalidCertificate(CertificateError::UnknownIssuer)),
+            "Untrusted issuer"
+        );
+        let expected = ServerName::try_from("localhost").unwrap();
+        let hostile_name = Error::InvalidCertificate(CertificateError::NotValidForNameContext {
+            expected,
+            presented: vec!["unknownissuer.example".into()],
+        });
+        assert_eq!(failure_reason(&hostile_name), "Hostname mismatch");
+        assert_eq!(
+            failure_reason(&Error::InvalidCertificate(CertificateError::Expired)),
+            "Expired"
+        );
+        assert_eq!(
+            failure_reason(&Error::InvalidCertificate(CertificateError::NotValidYet)),
+            "Not yet valid"
+        );
+        assert_eq!(
+            failure_reason(&Error::General("unknownissuer.example".into())),
+            "Other verification failure"
+        );
     }
 }

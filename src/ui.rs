@@ -56,11 +56,23 @@ fn security_tone(failed: bool, seconds_left: Option<i64>) -> SecurityTone {
         SecurityTone::Verified
     }
 }
-fn endpoint_host_label(endpoint: &str) -> String {
-    url::Url::parse(endpoint)
-        .ok()
-        .and_then(|url| url.host_str().map(one_line))
-        .unwrap_or_else(|| "server".into())
+fn current_certificate_failure(
+    capture: &crate::tls_observer::Capture,
+    now: i64,
+) -> Option<&'static str> {
+    capture.failure.or_else(|| {
+        let leaf = capture.chain.first()?;
+        if crate::certificates::seconds_until_validity(leaf, now).is_some_and(|seconds| seconds > 0)
+        {
+            Some("Not yet valid")
+        } else if crate::certificates::seconds_until_expiry(leaf, now)
+            .is_some_and(|seconds| seconds < 0)
+        {
+            Some("Expired")
+        } else {
+            None
+        }
+    })
 }
 fn pem_chain(chain: &[Vec<u8>]) -> String {
     let mut pem = String::new();
@@ -145,6 +157,12 @@ pub struct Workspace {
     rendered_rows: (usize, usize),
 }
 impl Workspace {
+    fn clear_tls_for_profile_edit(&mut self, old_endpoint: &str, old_ca_bundle: &str) {
+        if self.profile.endpoint != old_endpoint || self.profile.ca_bundle != old_ca_bundle {
+            self.tls_capture = None;
+            self.tls_panel_open = false;
+        }
+    }
     pub fn new(cc: &eframe::CreationContext<'_>, smoke: bool) -> Self {
         let path = directories::ProjectDirs::from("io.github", "romeroj1", "Dirlark-Public")
             .map(|p| p.config_dir().join("profiles.json"));
@@ -430,6 +448,8 @@ impl Workspace {
         self.preview = false;
         self.destructive_confirmed = false;
         self.connected = false;
+        self.tls_capture = None;
+        self.tls_panel_open = false;
     }
     fn poll(&mut self) {
         if !self.release.is_empty() && !self.busy {
@@ -504,8 +524,8 @@ impl Workspace {
             }
             Response::ConnectFailed(message, capture) => {
                 self.connecting_saves_or_uses_keychain = false;
+                self.tls_panel_open = capture.failure.is_some();
                 self.tls_capture = Some(capture);
-                self.tls_panel_open = true;
                 self.note(message);
             }
             Response::Disconnected => {
@@ -670,6 +690,8 @@ impl Workspace {
             .unwrap_or_else(|| self.profile.clone())
     }
     fn select_profile(&mut self, mut profile: Profile) {
+        self.tls_capture = None;
+        self.tls_panel_open = false;
         self.credential_locked_notice = None;
         if self.smoke.is_none() && !profile.bind_dn.is_empty() {
             match crate::profiles::probe_saved_password(&profile) {
@@ -832,6 +854,7 @@ impl Workspace {
         let mut forget = false;
         let prev_endpoint = self.profile.endpoint.clone();
         let prev_bind_dn = self.profile.bind_dn.clone();
+        let prev_ca_bundle = self.profile.ca_bundle.clone();
         ui.add_enabled_ui(!self.busy, |ui| {
             field(ui, "Profile name", &mut self.profile.name);
         });
@@ -895,6 +918,7 @@ impl Workspace {
                 ui.checkbox(&mut self.remember, "Save password in OS keychain");
             });
         });
+        self.clear_tls_for_profile_edit(&prev_endpoint, &prev_ca_bundle);
         ui.horizontal_wrapped(|ui| {
             if has_saved_password {
                 let indicator = if self.credential_locked_notice.is_some() {
@@ -1345,16 +1369,18 @@ impl Workspace {
     }
     fn security_lock(&mut self, ui: &mut egui::Ui) {
         let capture = self.tls_capture.as_ref();
-        let failure = capture.and_then(|c| c.failure);
-        let seconds = capture.and_then(|c| c.chain.first()).and_then(|der| {
-            crate::certificates::seconds_until_expiry(
-                der,
-                x509_parser::time::ASN1Time::now().timestamp(),
-            )
-        });
+        let now = x509_parser::time::ASN1Time::now().timestamp();
+        let failure = capture.and_then(|capture| current_certificate_failure(capture, now));
+        let seconds = capture
+            .and_then(|c| c.chain.first())
+            .and_then(|der| crate::certificates::seconds_until_expiry(der, now));
         let days = seconds.map(|seconds| (seconds / 86_400).max(0));
-        let label = if let Some(reason) = failure {
+        let label = if let Some(reason) =
+            failure.filter(|_| capture.is_some_and(|capture| capture.failure.is_some()))
+        {
             format!("TLS refused · {reason}")
+        } else if let Some(reason) = failure {
+            format!("Certificate {}", reason.to_ascii_lowercase())
         } else if let Some(days) = days.filter(|d| *d < 30) {
             format!("Connected · expires in {days} days")
         } else {
@@ -1385,15 +1411,19 @@ impl Workspace {
             self.tls_panel_open = false;
             return;
         };
+        let now = x509_parser::time::ASN1Time::now().timestamp();
+        let failure = current_certificate_failure(&capture, now);
         let mut open = true;
         egui::Window::new("Connection security").open(&mut open).default_width(470.0).resizable(true).show(ctx, |ui| {
             egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 120.0).max(220.0)).show(ui, |ui| {
-            if let Some(reason) = capture.failure {
+            if let Some(reason) = failure.filter(|_| capture.failure.is_some()) {
                 ui.colored_label(theme::colors(ui).error, format!("Connection refused · {reason}"));
+            } else if let Some(reason) = failure {
+                ui.colored_label(theme::colors(ui).error, format!("Certificate {}", reason.to_ascii_lowercase()));
             } else if capture.chain.is_empty() {
                 ui.heading("No TLS certificate captured");
             } else {
-                let seconds = capture.chain.first().and_then(|der| crate::certificates::seconds_until_expiry(der, x509_parser::time::ASN1Time::now().timestamp()));
+                let seconds = capture.chain.first().and_then(|der| crate::certificates::seconds_until_expiry(der, now));
                 if security_tone(false, seconds) == SecurityTone::Expiring {
                     let days = seconds.map(|seconds| (seconds / 86_400).max(0)).unwrap_or(0);
                     ui.colored_label(theme::colors(ui).warning, format!("Connection verified · certificate expires in {days} days"));
@@ -1402,10 +1432,10 @@ impl Workspace {
                 }
             }
             ui.label(format!("Protocol: {}", capture.protocol.unwrap_or("Negotiated TLS")));
-            let host = endpoint_host_label(&self.profile.endpoint);
-            let host_result = if capture.failure.is_some() { " · mismatch or unverified" } else if capture.chain.is_empty() { " · not verified" } else { " · matches certificate" };
+            let host = one_line(&capture.endpoint_host);
+            let host_result = if failure.is_some() { " · mismatch or unverified" } else if capture.chain.is_empty() { " · not verified" } else { " · matches certificate" };
             ui.label(format!("Hostname: {host}{host_result}"));
-            ui.label(format!("Trust: {}", if self.profile.ca_bundle.trim().is_empty() { "system trust store".to_owned() } else { format!("system trust store + CA bundle · {}", one_line(std::path::Path::new(&self.profile.ca_bundle).file_name().and_then(|n| n.to_str()).unwrap_or("CA bundle"))) }));
+            ui.label(format!("Trust: {}", one_line(&capture.trust_source)));
             ui.separator();
             ui.strong("Certificate chain sent by server");
             if capture.chain.is_empty() { ui.label("No certificate was received."); }
@@ -2912,11 +2942,35 @@ mod tests {
             SecurityTone::Verified
         );
         assert_eq!(security_tone(true, Some(29 * 86_400)), SecurityTone::Failed);
+        let make_window = |start: (i32, u8, u8), end: (i32, u8, u8)| {
+            let mut params =
+                rcgen::CertificateParams::new(vec!["directory.example.org".into()]).unwrap();
+            params.not_before = rcgen::date_time_ymd(start.0, start.1, start.2);
+            params.not_after = rcgen::date_time_ymd(end.0, end.1, end.2);
+            params
+                .self_signed(&rcgen::KeyPair::generate().unwrap())
+                .unwrap()
+                .der()
+                .to_vec()
+        };
+        let expired = make_window((2024, 1, 1), (2025, 1, 1));
+        let future = make_window((2027, 1, 1), (2028, 1, 1));
+        for (der, expected) in [(expired, "Expired"), (future, "Not yet valid")] {
+            let capture = crate::tls_observer::Capture {
+                chain: vec![der],
+                ..Default::default()
+            };
+            assert_eq!(current_certificate_failure(&capture, now), Some(expected));
+            assert_eq!(
+                security_tone(current_certificate_failure(&capture, now).is_some(), None),
+                SecurityTone::Failed
+            );
+        }
     }
     #[test]
     fn hostile_endpoint_labels_are_one_line_and_preserve_ipv6_host() {
         assert_eq!(
-            endpoint_host_label("ldaps://[2001:db8::1]:636"),
+            crate::directory::capture_host("ldaps://[2001:db8::1]:636"),
             "[2001:db8::1]"
         );
         assert_eq!(
@@ -2936,6 +2990,8 @@ mod tests {
                     chain: vec![vec![0x30, 0]],
                     failure: Some("Hostname mismatch"),
                     protocol: Some("TLS 1.3"),
+                    endpoint_host: "directory.example.org".into(),
+                    trust_source: "system trust store".into(),
                 },
             ),
         );
@@ -2946,6 +3002,68 @@ mod tests {
             Some("Hostname mismatch")
         );
         assert_eq!(workspace.status, "TLS certificate hostname mismatch");
+
+        workspace.connecting_saves_or_uses_keychain = true;
+        workspace.accept_response(
+            workspace.generation,
+            Response::ConnectFailed("Connection timed out".into(), Default::default()),
+        );
+        assert!(!workspace.connecting_saves_or_uses_keychain);
+        assert!(!workspace.tls_panel_open);
+    }
+    #[test]
+    fn security_capture_is_cleared_on_profile_switch_and_disconnect() {
+        let mut workspace = Workspace::from_path(egui::Context::default(), None, None, false);
+        workspace.tls_capture = Some(crate::tls_observer::Capture {
+            chain: vec![vec![0x30, 0]],
+            failure: None,
+            protocol: Some("TLS 1.3"),
+            endpoint_host: "a.example.test".into(),
+            trust_source: "system trust store".into(),
+        });
+        workspace.tls_panel_open = true;
+        workspace.select_profile(Profile {
+            name: "Second profile".into(),
+            endpoint: "ldaps://b.example.test:636".into(),
+            ..Profile::default()
+        });
+        assert!(workspace.tls_capture.is_none());
+        assert!(!workspace.tls_panel_open);
+
+        workspace.tls_capture = Some(crate::tls_observer::Capture {
+            chain: vec![vec![0x30, 0]],
+            endpoint_host: "b.example.test".into(),
+            trust_source: "system trust store".into(),
+            ..Default::default()
+        });
+        workspace.tls_panel_open = true;
+        workspace.accept_response(workspace.generation, Response::Disconnected);
+        assert!(workspace.tls_capture.is_none());
+        assert!(!workspace.tls_panel_open);
+    }
+    #[test]
+    fn endpoint_or_ca_bundle_edit_clears_captured_peer_details() {
+        let mut workspace = Workspace::from_path(egui::Context::default(), None, None, false);
+        workspace.profile.endpoint = "ldaps://a.example.test:636".into();
+        workspace.profile.ca_bundle = "/tmp/ca-a.pem".into();
+        workspace.tls_capture = Some(crate::tls_observer::Capture {
+            chain: vec![vec![0x30, 0]],
+            endpoint_host: "a.example.test".into(),
+            trust_source: "system trust store + CA bundle · ca-a.pem".into(),
+            ..Default::default()
+        });
+        workspace.tls_panel_open = true;
+        workspace.profile.endpoint = "ldaps://b.example.test:636".into();
+        workspace.clear_tls_for_profile_edit("ldaps://a.example.test:636", "/tmp/ca-a.pem");
+        assert!(workspace.tls_capture.is_none());
+        assert!(!workspace.tls_panel_open);
+
+        workspace.tls_capture = Some(crate::tls_observer::Capture::default());
+        workspace.tls_panel_open = true;
+        workspace.profile.ca_bundle = "/tmp/ca-b.pem".into();
+        workspace.clear_tls_for_profile_edit("ldaps://b.example.test:636", "/tmp/ca-a.pem");
+        assert!(workspace.tls_capture.is_none());
+        assert!(!workspace.tls_panel_open);
     }
     #[test]
     fn pem_export_round_trips_captured_der_and_caps_the_chain() {

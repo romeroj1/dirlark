@@ -514,6 +514,12 @@ fn ldaps_protocol_read_write_schema_and_unbind() {
                 .await
                 .unwrap();
             assert_eq!(capture.failure, None);
+            assert_eq!(capture.endpoint_host, "localhost");
+            assert!(
+                capture
+                    .trust_source
+                    .starts_with("system trust store + CA bundle")
+            );
             assert!(!capture.chain.is_empty());
             assert!(matches!(capture.protocol, Some("TLS 1.2" | "TLS 1.3")));
             let leaf = dirlark::certificates::inspect(
@@ -669,6 +675,8 @@ fn tls_rejects_unknown_ca_wrong_host_and_expired_certificate() {
             "unexpected unknown CA error: {unknown_err}"
         );
         assert_eq!(unknown_capture.failure, Some("Untrusted issuer"));
+        assert_eq!(unknown_capture.endpoint_host, "localhost");
+        assert_eq!(unknown_capture.trust_source, "system trust store");
         assert!(!unknown_capture.chain.is_empty());
         assert!(server.operations.lock().unwrap().is_empty());
         let wrong = Mock::start("wrong.example", false).await;
