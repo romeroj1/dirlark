@@ -135,7 +135,9 @@ fn convert(raw: ldap3::ResultEntry) -> Entry {
         attrs,
     }
 }
-pub fn tls_config(ca_bundle: &str) -> Result<Arc<rustls::ClientConfig>, String> {
+pub fn tls_config(
+    ca_bundle: &str,
+) -> Result<(Arc<rustls::ClientConfig>, crate::tls_observer::Slot), String> {
     let mut roots = rustls::RootCertStore::empty();
     for cert in rustls_native_certs::load_native_certs().certs {
         let _ = roots.add(cert);
@@ -162,14 +164,19 @@ pub fn tls_config(ca_bundle: &str) -> Result<Arc<rustls::ClientConfig>, String> 
     if roots.is_empty() {
         return Err("No trusted root certificates available".into());
     }
+    let slot = Arc::new(std::sync::Mutex::new(
+        crate::tls_observer::Capture::default(),
+    ));
+    let verifier = crate::tls_observer::verifier(roots, slot.clone()).map_err(str::to_owned)?;
     let config = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
     .with_safe_default_protocol_versions()
     .map_err(|_| "TLS configuration failed")?
-    .with_root_certificates(roots)
+    .dangerous()
+    .with_custom_certificate_verifier(verifier)
     .with_no_client_auth();
-    Ok(Arc::new(config))
+    Ok((Arc::new(config), slot))
 }
 pub struct Directory {
     ldap: Ldap,
@@ -186,6 +193,32 @@ pub const BLANK_BIND_DN_WITH_PASSWORD: &str = "Bind DN is blank: this would conn
 
 impl Directory {
     pub async fn connect(profile: &Profile, password: &str) -> Result<Self, String> {
+        Self::connect_observed(profile, password)
+            .await
+            .map(|(directory, _)| directory)
+            .map_err(|(error, _)| error)
+    }
+    pub async fn connect_observed(
+        profile: &Profile,
+        password: &str,
+    ) -> Result<(Self, crate::tls_observer::Capture), (String, crate::tls_observer::Capture)> {
+        let (config, slot) = tls_config(&profile.ca_bundle).map_err(|e| (e, Default::default()))?;
+        match Self::connect_with_config(profile, password, config).await {
+            Ok(directory) => {
+                let capture = slot.lock().map(|value| value.clone()).unwrap_or_default();
+                Ok((directory, capture))
+            }
+            Err(error) => {
+                let capture = slot.lock().map(|value| value.clone()).unwrap_or_default();
+                Err((error, capture))
+            }
+        }
+    }
+    async fn connect_with_config(
+        profile: &Profile,
+        password: &str,
+        config: Arc<rustls::ClientConfig>,
+    ) -> Result<Self, String> {
         profile.validate()?;
         let bind_dn = profile.bind_dn.trim();
         if bind_dn.is_empty() && !password.is_empty() {
@@ -196,7 +229,7 @@ impl Directory {
         }
         let settings = LdapConnSettings::new()
             .set_conn_timeout(TIMEOUT)
-            .set_config(tls_config(&profile.ca_bundle)?);
+            .set_config(config);
         let (conn, ldap) = tokio::time::timeout(
             TIMEOUT,
             LdapConnAsync::with_settings(settings, &profile.endpoint),
@@ -700,7 +733,8 @@ pub enum Request {
 }
 pub enum Response {
     CredentialStatus(Result<(), String>),
-    Connected(Vec<String>),
+    Connected(Vec<String>, crate::tls_observer::Capture),
+    ConnectFailed(String, crate::tls_observer::Capture),
     Disconnected,
     Page(crate::page_cache::Key, Query, u16, Box<Page>, bool),
     Closed,
@@ -771,7 +805,12 @@ async fn execute(directory: &mut Option<Directory>, request: Request) -> Result<
             if !p.bind_dn.is_empty() && password.is_empty() {
                 *password = crate::profiles::saved_password(&p)?;
             }
-            let mut d = Directory::connect(&p, &password).await?;
+            let (mut d, capture_slot) = match Directory::connect_observed(&p, &password).await {
+                Ok((directory, capture)) => (directory, capture),
+                Err((error, capture)) => {
+                    return Ok(Response::ConnectFailed(error, capture));
+                }
+            };
             let roots = if p.base_dn.is_empty() {
                 d.read("").await?.values("namingContexts")
             } else {
@@ -783,7 +822,7 @@ async fn execute(directory: &mut Option<Directory>, request: Request) -> Result<
                     .map_err(|_| "Connected, but credential storage failed; connection closed")?;
             }
             *directory = Some(d);
-            Ok(Response::Connected(roots))
+            Ok(Response::Connected(roots, capture_slot))
         }
         Request::CloseCursors(cursors) => {
             if let Some(d) = directory {

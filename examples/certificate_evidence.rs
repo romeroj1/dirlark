@@ -3,6 +3,20 @@
 #[path = "support/certificates.rs"]
 mod certificates;
 #[cfg(debug_assertions)]
+fn expiring_soon() -> Vec<u8> {
+    let mut params = rcgen::CertificateParams::new(vec!["directory.example.test".into()]).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Synthetic Directory Certificate");
+    params.not_before = rcgen::date_time_ymd(2025, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2026, 11, 4);
+    params
+        .self_signed(&rcgen::KeyPair::generate().unwrap())
+        .unwrap()
+        .der()
+        .to_vec()
+}
+#[cfg(debug_assertions)]
 fn main() -> eframe::Result {
     use dirlark::{model::Entry, ui::evidence};
     use eframe::egui;
@@ -24,6 +38,11 @@ fn main() -> eframe::Result {
     let first = certificates::sample(false, false);
     let expired = certificates::sample(true, false);
     let ca = certificates::sample(false, true);
+    let security_der = match scene.as_str() {
+        "tls-expiring" => expiring_soon(),
+        "tls-failed" => first.clone(),
+        _ => first.clone(),
+    };
     let entry = Entry {
         dn: "uid=certificate-demo,ou=People,dc=example,dc=test".into(),
         attrs: [
@@ -59,7 +78,18 @@ fn main() -> eframe::Result {
             });
             cc.egui_ctx.set_zoom_factor(zoom);
             let app = evidence::workspace(cc.egui_ctx.clone(), "editor", path);
-            Ok(Box::new(evidence::certificate_scene(app, entry, &scene)))
+            if matches!(
+                scene.as_str(),
+                "tls-healthy" | "tls-expiring" | "tls-failed"
+            ) {
+                Ok(Box::new(evidence::connection_security_scene(
+                    app,
+                    security_der,
+                    &scene,
+                )))
+            } else {
+                Ok(Box::new(evidence::certificate_scene(app, entry, &scene)))
+            }
         }),
     )
 }

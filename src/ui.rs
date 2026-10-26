@@ -27,6 +27,63 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+fn one_line(value: &str) -> String {
+    value
+        .chars()
+        .take(160)
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
+                '\u{fffd}'
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SecurityTone {
+    Verified,
+    Expiring,
+    Failed,
+}
+fn security_tone(failed: bool, days_left: Option<i64>) -> SecurityTone {
+    if failed {
+        SecurityTone::Failed
+    } else if days_left.is_some_and(|days| days < 30) {
+        SecurityTone::Expiring
+    } else {
+        SecurityTone::Verified
+    }
+}
+fn certificate_days_left(der: &[u8], now: i64) -> Option<i64> {
+    let parts =
+        crate::certificates::inspect(der, crate::certificates::Kind::Certificate, now).ok()?;
+    let cert = parts.first()?.certificate.as_ref().ok()?;
+    cert.fields
+        .iter()
+        .find(|(name, _)| name == "Validity status")?
+        .1
+        .strip_prefix("Expires in ")?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+fn pem_chain(chain: &[Vec<u8>]) -> String {
+    let mut pem = String::new();
+    for der in chain.iter().take(10).filter(|der| der.len() <= 64 * 1024) {
+        let encoded = STANDARD.encode(der);
+        pem.push_str("-----BEGIN CERTIFICATE-----\n");
+        for line in encoded.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(line).unwrap_or(""));
+            pem.push('\n');
+        }
+        pem.push_str("-----END CERTIFICATE-----\n");
+    }
+    pem
+}
+
 pub struct Workspace {
     #[cfg(debug_assertions)]
     evidence_readonly: bool,
@@ -59,6 +116,10 @@ pub struct Workspace {
     selected: Option<Entry>,
     pending_read: Option<String>,
     certificate_viewer: Option<certificate_view::Viewer>,
+    tls_capture: Option<crate::tls_observer::Capture>,
+    tls_panel_open: bool,
+    tls_selected: usize,
+    tls_pem_path: String,
     attributes_height: f32,
     base: String,
     filter: String,
@@ -216,6 +277,10 @@ impl Workspace {
             selected: None,
             pending_read: None,
             certificate_viewer: None,
+            tls_capture: None,
+            tls_panel_open: false,
+            tls_selected: 0,
+            tls_pem_path: String::new(),
             attributes_height: DEFAULT_ATTRIBUTES_HEIGHT,
             filter: "(objectClass=*)".into(),
             attrs: "*".into(),
@@ -404,7 +469,8 @@ impl Workspace {
                 }
                 self.credential_storage = status;
             }
-            Response::Connected(roots) => {
+            Response::Connected(roots, capture) => {
+                self.tls_capture = Some(capture);
                 self.connected = true;
                 if self.base.trim().is_empty()
                     && let Some(first) = roots.first()
@@ -441,6 +507,18 @@ impl Workspace {
                 }
                 self.connecting_saves_or_uses_keychain = false;
                 self.note("Connected · TLS certificate and hostname verified".into());
+            }
+            Response::ConnectFailed(message, mut capture) => {
+                if capture.failure.is_none()
+                    && !capture.chain.is_empty()
+                    && (message.starts_with("TLS certificate")
+                        || message.starts_with("TLS handshake"))
+                {
+                    capture.failure = Some("Other verification failure");
+                }
+                self.tls_capture = Some(capture);
+                self.tls_panel_open = true;
+                self.note(message);
             }
             Response::Disconnected => {
                 self.clear_data();
@@ -660,6 +738,8 @@ impl Workspace {
         }
         self.generation += 1;
         self.clear_data();
+        self.tls_capture = None;
+        self.tls_panel_open = false;
         self.base = self.profile.base_dn.clone();
         self.connecting_saves_or_uses_keychain =
             !self.profile.bind_dn.is_empty() && (self.remember || self.password.is_empty());
@@ -941,6 +1021,7 @@ impl Workspace {
                             &self.profile.bind_dn
                         }
                     ));
+                    self.security_lock(ui);
                     if icons::button(ui, icons::Icon::Disconnect, "Disconnect", !self.busy)
                         .clicked()
                     {
@@ -948,11 +1029,14 @@ impl Workspace {
                     }
                 });
             } else {
-                ui.label(
-                    egui::RichText::new(icons::Icon::TlsVerified.text("TLS verified"))
-                        .color(theme::colors(ui).accent)
-                        .strong(),
-                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(icons::Icon::TlsVerified.text("TLS verified"))
+                            .color(theme::colors(ui).accent)
+                            .strong(),
+                    );
+                    self.security_lock(ui);
+                });
                 ui.add(
                     egui::Label::new(egui::RichText::new(&self.profile.endpoint).monospace())
                         .truncate(),
@@ -1000,6 +1084,19 @@ impl Workspace {
                 }
             }
         } else {
+            if self
+                .tls_capture
+                .as_ref()
+                .is_some_and(|c| c.failure.is_some())
+            {
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        theme::colors(ui).error,
+                        "Connection refused · TLS verification failed",
+                    );
+                    self.security_lock(ui);
+                });
+            }
             let mut area = egui::ScrollArea::vertical()
                 .id_salt("connection-fields")
                 .max_height((ui.available_height() - 185.0).max(100.0));
@@ -1256,6 +1353,110 @@ impl Workspace {
             Some(TreeAction::Read(dn)) => self.send(Request::Read(dn)),
             Some(TreeAction::More(dn)) => self.more(Key::Children(dn), None),
             None => {}
+        }
+    }
+    fn security_lock(&mut self, ui: &mut egui::Ui) {
+        let capture = self.tls_capture.as_ref();
+        let failure = capture.and_then(|c| c.failure);
+        let days = capture.and_then(|c| c.chain.first()).and_then(|der| {
+            certificate_days_left(der, x509_parser::time::ASN1Time::now().timestamp())
+        });
+        let label = if let Some(reason) = failure {
+            format!("TLS refused · {reason}")
+        } else if let Some(days) = days.filter(|d| *d < 30) {
+            format!("Connected · expires in {days} days")
+        } else {
+            "Connected · TLS verified".into()
+        };
+        let tone = security_tone(failure.is_some(), days);
+        let color = match tone {
+            SecurityTone::Failed => theme::colors(ui).error,
+            SecurityTone::Expiring => theme::colors(ui).warning,
+            SecurityTone::Verified => theme::colors(ui).accent,
+        };
+        if ui
+            .button(egui::RichText::new(format!("🔒 {label}")).color(color))
+            .on_hover_text("Connection security details")
+            .clicked()
+        {
+            self.tls_panel_open = !self.tls_panel_open;
+        }
+    }
+    fn tls_panel(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.tls_panel_open = false;
+        }
+        if !self.tls_panel_open {
+            return;
+        }
+        let Some(capture) = self.tls_capture.clone() else {
+            self.tls_panel_open = false;
+            return;
+        };
+        let mut open = true;
+        egui::Window::new("Connection security").open(&mut open).default_width(470.0).resizable(true).show(ctx, |ui| {
+            if let Some(reason) = capture.failure {
+                ui.colored_label(theme::colors(ui).error, format!("Connection refused · {reason}"));
+            } else if capture.chain.is_empty() {
+                ui.heading("No TLS certificate captured");
+            } else {
+                ui.heading("Connection verified");
+            }
+            ui.label(format!("Protocol: {}", capture.protocol.unwrap_or("Negotiated TLS")));
+            let host = self.profile.endpoint.split("://").nth(1).unwrap_or("server").split([':', '/']).next().unwrap_or("server");
+            let host_result = if capture.failure.is_some() { " · mismatch or unverified" } else if capture.chain.is_empty() { " · not verified" } else { " · matches certificate" };
+            ui.label(format!("Hostname: {}{}", one_line(host), host_result));
+            ui.label(format!("Trust: {}", if self.profile.ca_bundle.trim().is_empty() { "system trust store".to_owned() } else { format!("selected CA bundle · {}", one_line(std::path::Path::new(&self.profile.ca_bundle).file_name().and_then(|n| n.to_str()).unwrap_or("CA bundle"))) }));
+            ui.separator();
+            ui.strong("Certificate chain sent by server");
+            if capture.chain.is_empty() { ui.label("No certificate was received."); }
+            for (index, der) in capture.chain.iter().take(10).enumerate() {
+                let parts = crate::certificates::inspect(der, crate::certificates::Kind::Certificate, x509_parser::time::ASN1Time::now().timestamp());
+                let label = parts.as_ref().ok().and_then(|p| p.first()).and_then(|p| p.certificate.as_ref().ok()).and_then(|c| c.fields.iter().find(|(k,_)| k == "Subject").map(|(_,v)| v.clone())).unwrap_or_else(|| format!("Certificate {} · malformed", index + 1));
+                if ui.selectable_label(self.tls_selected == index, format!("{}{}", if index == 0 { "Server certificate · " } else { "Certificate · " }, label)).clicked() { self.tls_selected = index; }
+            }
+            if let Some(der) = capture.chain.get(self.tls_selected.min(capture.chain.len().saturating_sub(1))) {
+                if let Ok(parts) = crate::certificates::inspect(der, crate::certificates::Kind::Certificate, x509_parser::time::ASN1Time::now().timestamp()) {
+                    if let Some(Ok(cert)) = parts.first().map(|p| &p.certificate) {
+                        for (name,value) in &cert.fields { output::show(ui, name, value); }
+                        ui.horizontal_wrapped(|ui| {
+                            if let Some((_,sha)) = cert.fields.iter().find(|(k,_)| k == "SHA-256 fingerprint") && ui.button("Copy SHA-256").clicked() { ui.ctx().copy_text(sha.clone()); }
+                            if ui.button("Open in certificate viewer").clicked() { self.certificate_viewer = certificate_view::Viewer::from_der(der); }
+                        });
+                    }
+                } else { ui.label("Certificate could not be decoded safely."); }
+            }
+            ui.horizontal(|ui| {
+                ui.label("Save chain as PEM"); ui.text_edit_singleline(&mut self.tls_pem_path);
+                if ui.button("Save…").clicked() { self.save_tls_chain(&capture.chain); }
+            });
+            ui.label("Display only. Trust and hostname verification remain mandatory; this panel never changes trust.");
+        });
+        self.tls_panel_open = open;
+    }
+    fn save_tls_chain(&mut self, chain: &[Vec<u8>]) {
+        use std::io::Write;
+        let path = match crate::model::expand_local_path(&self.tls_pem_path) {
+            Ok(path) => path,
+            Err(msg) => {
+                self.note(msg);
+                return;
+            }
+        };
+        let pem = pem_chain(chain);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options
+            .open(path)
+            .and_then(|mut f| f.write_all(pem.as_bytes()))
+        {
+            Ok(()) => self.note("Server-sent certificate chain saved as PEM".into()),
+            Err(_) => self.note("Could not save PEM chain; choose a new writable file path".into()),
         }
     }
     fn entry_view(&mut self, ui: &mut egui::Ui) {
@@ -2573,6 +2774,7 @@ impl Workspace {
                 }
             });
         self.preview_window(&ctx);
+        self.tls_panel(&ctx);
         if let Some(viewer) = &mut self.certificate_viewer
             && !viewer.show(&ctx, self.selected.as_ref())
         {
@@ -2671,6 +2873,45 @@ fn attributes_splitter(ui: &mut egui::Ui, desired: &mut f32, available: f32) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn security_panel_expiry_threshold_uses_injected_clock() {
+        let now = rcgen::date_time_ymd(2026, 1, 3).unix_timestamp();
+        let cert = |month, day| {
+            let mut params =
+                rcgen::CertificateParams::new(vec!["directory.example.org".into()]).unwrap();
+            params.not_before = rcgen::date_time_ymd(2025, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2026, month, day);
+            params
+                .self_signed(&rcgen::KeyPair::generate().unwrap())
+                .unwrap()
+                .der()
+                .to_vec()
+        };
+        assert_eq!(certificate_days_left(&cert(2, 1), now), Some(29));
+        assert_eq!(
+            security_tone(false, certificate_days_left(&cert(2, 1), now)),
+            SecurityTone::Expiring
+        );
+        assert_eq!(certificate_days_left(&cert(2, 3), now), Some(31));
+        assert_eq!(
+            security_tone(false, certificate_days_left(&cert(2, 3), now)),
+            SecurityTone::Verified
+        );
+        assert_eq!(security_tone(true, Some(29)), SecurityTone::Failed);
+    }
+    #[test]
+    fn pem_export_round_trips_captured_der_and_caps_the_chain() {
+        let chain = (0..12).map(|n| vec![n as u8; 32]).collect::<Vec<_>>();
+        let pem = pem_chain(&chain);
+        assert_eq!(pem.matches("BEGIN CERTIFICATE").count(), 10);
+        let first_body = pem
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.starts_with("-----END"))
+            .collect::<String>();
+        assert_eq!(STANDARD.decode(first_body).unwrap(), chain[0]);
+        assert!(!pem.contains(&STANDARD.encode(&chain[10])));
+    }
     #[test]
     fn empty_and_pending_details_never_show_the_previous_entry() {
         let ctx = egui::Context::default();
@@ -3231,7 +3472,10 @@ mod tests {
         assert!(w.preview);
         assert_eq!(w.pending.len(), 1);
         assert!(!w.busy);
-        w.accept_response(1, Response::Connected(vec!["dc=stale".into()]));
+        w.accept_response(
+            1,
+            Response::Connected(vec!["dc=stale".into()], Default::default()),
+        );
         assert!(!w.connected);
         assert!(w.roots.is_empty());
     }
@@ -3615,7 +3859,10 @@ mod tests {
         w.connecting_saves_or_uses_keychain =
             !w.profile.bind_dn.is_empty() && (w.remember || w.password.is_empty());
         w.busy = true;
-        w.accept_response(0, Response::Connected(vec!["dc=example,dc=org".into()]));
+        w.accept_response(
+            0,
+            Response::Connected(vec!["dc=example,dc=org".into()], Default::default()),
+        );
         assert!(w.profile.password_saved);
         assert!(w.remember);
         assert!(crate::profiles::load(&path).unwrap()[0].password_saved);
@@ -3805,7 +4052,10 @@ mod tests {
         let mut w = workspace(dir.path().join("profiles.json"));
         assert_eq!(w.scope, 2, "search scope must default to Subtree");
         // Connected with no discovered roots and empty base DN: run_search refuses cleanly without dispatching.
-        w.accept_response(w.generation, Response::Connected(vec![]));
+        w.accept_response(
+            w.generation,
+            Response::Connected(vec![], Default::default()),
+        );
         assert!(w.base.is_empty());
         w.run_search();
         assert!(!w.busy);
@@ -3813,7 +4063,7 @@ mod tests {
         // Connected with a discovered naming context populates base DN automatically when blank.
         w.accept_response(
             w.generation,
-            Response::Connected(vec!["dc=example,dc=org".into()]),
+            Response::Connected(vec!["dc=example,dc=org".into()], Default::default()),
         );
         assert_eq!(w.base, "dc=example,dc=org");
         // Typing in quick_search and calling run_search applies smart_filter automatically.
@@ -3848,7 +4098,7 @@ mod tests {
         let mut w = workspace(dir.path().join("profiles.json"));
         w.accept_response(
             w.generation,
-            Response::Connected(vec!["dc=example,dc=org".into()]),
+            Response::Connected(vec!["dc=example,dc=org".into()], Default::default()),
         );
         // When filter is still default or matches the last generated filter, typing in quick_search updates it.
         w.quick_search = "al".into();
