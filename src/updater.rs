@@ -435,11 +435,23 @@ fn validate_staged_paths(root: &Path, update: &StagedUpdate) -> Result<(PathBuf,
         return Err(());
     }
     #[cfg(target_os = "macos")]
-    if !launch.is_dir() || launch.file_name().is_none_or(|name| name != "DIRLARK.app") {
+    if !launch.is_dir()
+        || launch.file_name().is_none_or(|name| name != "DIRLARK.app")
+        || !executable.starts_with(&launch)
+        || executable.file_name().is_none_or(|name| name != "dirlark")
+    {
         return Err(());
     }
     #[cfg(not(target_os = "macos"))]
-    if launch != executable {
+    if launch != executable
+        || executable.file_name().is_none_or(|name| {
+            name != if cfg!(target_os = "windows") {
+                "dirlark.exe"
+            } else {
+                "dirlark"
+            }
+        })
+    {
         return Err(());
     }
     Ok((launch, executable))
