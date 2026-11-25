@@ -1,6 +1,14 @@
 # Changelog
 
-## 0.1.0-alpha.5 — prepared
+## 0.1.0-alpha.6 — prepared
+
+Replica TLS hostname bypass option, in-app update checker foundation, and dependency security updates. See [alpha.6 notes](docs/releases/0.1.0-alpha.6.md) for release limits and signing status.
+
+- Added optional `tls_skip_hostname_verification` checkbox in connection profiles to allow connecting to directory replicas or IP endpoints presenting generic SAN certificates. Hostname bypass strictly requires a non-empty user CA bundle; public root CAs are prohibited for this mode. Chain validity and cryptographic signatures remain mandatory (Issue #18).
+- Added an in-app background update engine and status pill for update notifications, release asset staging, and seamless in-place application restart (Issue #19).
+- Upgraded `url` to 2.5.9 resolving `RUSTSEC-2026-0592`, alongside open Dependabot dependency updates.
+
+## 0.1.0-alpha.5 — published 2026-10-27 UTC
 
 Display-only TLS connection evidence, a native credential-store self-test and a Tokio dependency update. See [alpha.5 notes](docs/releases/0.1.0-alpha.5.md) for release limits and signing status.
 
