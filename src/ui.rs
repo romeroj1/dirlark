@@ -92,6 +92,7 @@ pub struct Workspace {
     #[cfg(debug_assertions)]
     evidence_readonly: bool,
     worker: Worker,
+    updater: crate::updater::Updater,
     generation: u64,
     busy: bool,
     connected: bool,
@@ -157,8 +158,16 @@ pub struct Workspace {
     rendered_rows: (usize, usize),
 }
 impl Workspace {
-    fn clear_tls_for_profile_edit(&mut self, old_endpoint: &str, old_ca_bundle: &str) {
-        if self.profile.endpoint != old_endpoint || self.profile.ca_bundle != old_ca_bundle {
+    fn clear_tls_for_profile_edit(
+        &mut self,
+        old_endpoint: &str,
+        old_ca_bundle: &str,
+        old_skip_hostname: bool,
+    ) {
+        if self.profile.endpoint != old_endpoint
+            || self.profile.ca_bundle != old_ca_bundle
+            || self.profile.tls_skip_hostname_verification != old_skip_hostname
+        {
             self.tls_capture = None;
             self.tls_panel_open = false;
         }
@@ -167,6 +176,9 @@ impl Workspace {
         let path = directories::ProjectDirs::from("io.github", "romeroj1", "Dirlark-Public")
             .map(|p| p.config_dir().join("profiles.json"));
         let mut app = Self::from_path(cc.egui_ctx.clone(), path, None, smoke);
+        if !smoke && crate::updater::release_build_enabled() {
+            app.updater = crate::updater::Updater::start(cc.egui_ctx.clone());
+        }
         if cfg!(target_os = "linux") {
             app.send(Request::CredentialStatus);
         }
@@ -259,6 +271,7 @@ impl Workspace {
             #[cfg(debug_assertions)]
             evidence_readonly: false,
             worker: Worker::start(ctx),
+            updater: crate::updater::Updater::idle(),
             generation: 0,
             busy: false,
             connected: false,
@@ -855,6 +868,7 @@ impl Workspace {
         let prev_endpoint = self.profile.endpoint.clone();
         let prev_bind_dn = self.profile.bind_dn.clone();
         let prev_ca_bundle = self.profile.ca_bundle.clone();
+        let prev_skip_hostname = self.profile.tls_skip_hostname_verification;
         ui.add_enabled_ui(!self.busy, |ui| {
             field(ui, "Profile name", &mut self.profile.name);
         });
@@ -918,7 +932,6 @@ impl Workspace {
                 ui.checkbox(&mut self.remember, "Save password in OS keychain");
             });
         });
-        self.clear_tls_for_profile_edit(&prev_endpoint, &prev_ca_bundle);
         ui.horizontal_wrapped(|ui| {
             if has_saved_password {
                 let indicator = if self.credential_locked_notice.is_some() {
@@ -963,20 +976,33 @@ impl Workspace {
                 .response
                 .on_hover_text(message);
             }
-            ui.collapsing("TLS trust · extra CA bundle", |ui| {
+            ui.collapsing("TLS trust · CA bundle", |ui| {
                 field_with_hint(
                     ui,
-                    "Extra CA bundle PEM path",
+                    "CA bundle PEM path",
                     "Full path or ~/… (for example ~/certs/ca.pem)",
                     &mut self.profile.ca_bundle,
                 );
             });
+            ui.checkbox(
+                &mut self.profile.tls_skip_hostname_verification,
+                "Allow hostname mismatch (skip hostname verification)",
+            )
+            .on_hover_text("Useful for direct replica/IP connections. Requires a CA bundle; system trust roots will not be used while this is enabled.");
+            if self.profile.tls_skip_hostname_verification {
+                theme::note(ui, "Hostname verification relaxed", "Requires an explicit CA bundle. Only certificates chaining to that bundle are accepted; system/public roots are excluded. Hostname matching is skipped, so use only for a replica you trust.", true);
+            }
             ui.label(
-                egui::RichText::new("System roots + selected CA. TLS verification is mandatory.")
+                egui::RichText::new(if self.profile.tls_skip_hostname_verification {
+                    "Selected CA bundle only. Chain, validity and TLS signature checks remain mandatory."
+                } else {
+                    "System roots + selected CA. Certificate-chain verification remains mandatory."
+                })
                     .small()
                     .color(theme::colors(ui).muted),
             );
         });
+        self.clear_tls_for_profile_edit(&prev_endpoint, &prev_ca_bundle, prev_skip_hostname);
         if forget {
             self.forget_password();
         } else if submit {
@@ -1021,8 +1047,12 @@ impl Workspace {
             if compact {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
-                        egui::RichText::new(icons::Icon::TlsVerified.text("TLS verified"))
-                            .color(theme::colors(ui).accent),
+                        egui::RichText::new(if self.profile.tls_skip_hostname_verification {
+                            "⚠ TLS hostname check skipped".to_owned()
+                        } else {
+                            icons::Icon::TlsVerified.text("TLS verified")
+                        })
+                        .color(theme::colors(ui).accent),
                     )
                     .on_hover_text(format!(
                         "{}\nIdentity: {}",
@@ -1043,9 +1073,13 @@ impl Workspace {
             } else {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new(icons::Icon::TlsVerified.text("TLS verified"))
-                            .color(theme::colors(ui).accent)
-                            .strong(),
+                        egui::RichText::new(if self.profile.tls_skip_hostname_verification {
+                            "⚠ TLS hostname check skipped".to_owned()
+                        } else {
+                            icons::Icon::TlsVerified.text("TLS verified")
+                        })
+                        .color(theme::colors(ui).accent)
+                        .strong(),
                     );
                     self.security_lock(ui);
                 });
@@ -2620,6 +2654,7 @@ impl Workspace {
     }
     fn render(&mut self, ui: &mut egui::Ui) {
         self.poll();
+        self.updater.poll();
         let ctx = ui.ctx().clone();
         self.shortcuts(&ctx);
         let palette = theme::colors(ui);
@@ -2702,7 +2737,7 @@ impl Workspace {
                     if self.busy {
                         ui.spinner();
                     }
-                    let width = (ui.available_width() - 120.0).max(80.0);
+                    let width = (ui.available_width() - 310.0).max(80.0);
                     ui.add_sized(
                         [width, 24.0],
                         egui::Label::new(
@@ -2719,6 +2754,31 @@ impl Workspace {
                         .clicked()
                     {
                         self.cancel_page();
+                    }
+                    enum UpdateClick {
+                        Download,
+                        Restart(crate::updater::StagedUpdate),
+                    }
+                    let action = match self.updater.state().clone() {
+                        crate::updater::State::Available { version, .. } => ui
+                            .button(format!("⤓ Update {version} available"))
+                            .clicked()
+                            .then_some(UpdateClick::Download),
+                        crate::updater::State::Downloading { .. } => {
+                            ui.spinner();
+                            ui.small("Preparing update…");
+                            None
+                        }
+                        crate::updater::State::Ready { version, update } => ui
+                            .button(format!("↺ Restart to apply {version}"))
+                            .clicked()
+                            .then_some(UpdateClick::Restart(update)),
+                        _ => None,
+                    };
+                    match action {
+                        Some(UpdateClick::Download) => self.updater.download(),
+                        Some(UpdateClick::Restart(update)) => self.updater.restart(update),
+                        None => {}
                     }
                 });
                 ui.collapsing("Operation log", |ui| {
@@ -3054,14 +3114,21 @@ mod tests {
         });
         workspace.tls_panel_open = true;
         workspace.profile.endpoint = "ldaps://b.example.test:636".into();
-        workspace.clear_tls_for_profile_edit("ldaps://a.example.test:636", "/tmp/ca-a.pem");
+        workspace.clear_tls_for_profile_edit("ldaps://a.example.test:636", "/tmp/ca-a.pem", false);
         assert!(workspace.tls_capture.is_none());
         assert!(!workspace.tls_panel_open);
 
         workspace.tls_capture = Some(crate::tls_observer::Capture::default());
         workspace.tls_panel_open = true;
         workspace.profile.ca_bundle = "/tmp/ca-b.pem".into();
-        workspace.clear_tls_for_profile_edit("ldaps://b.example.test:636", "/tmp/ca-a.pem");
+        workspace.clear_tls_for_profile_edit("ldaps://b.example.test:636", "/tmp/ca-a.pem", false);
+        assert!(workspace.tls_capture.is_none());
+        assert!(!workspace.tls_panel_open);
+
+        workspace.tls_capture = Some(crate::tls_observer::Capture::default());
+        workspace.tls_panel_open = true;
+        workspace.profile.tls_skip_hostname_verification = true;
+        workspace.clear_tls_for_profile_edit("ldaps://b.example.test:636", "/tmp/ca-b.pem", false);
         assert!(workspace.tls_capture.is_none());
         assert!(!workspace.tls_panel_open);
     }

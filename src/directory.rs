@@ -37,22 +37,22 @@ pub fn connect_error(err: &ldap3::LdapError, endpoint: &str) -> String {
     let lower = combined.to_ascii_lowercase();
     if combined.contains("NotValidForName") || lower.contains("not valid for") {
         format!(
-            "TLS certificate hostname mismatch for {host}: certificate is not valid for this host. Connect using a DNS name on the certificate; TLS verification cannot be disabled"
+            "TLS certificate hostname mismatch for {host}: use a matching DNS name or explicitly enable the profile's hostname-mismatch option. Certificate-chain validation remains mandatory"
         )
     } else if combined.contains("UnknownIssuer") || lower.contains("unknown issuer") {
-        "TLS certificate issuer is not trusted (unknown CA). Add the issuing CA PEM under TLS trust · extra CA bundle; TLS verification cannot be disabled".into()
+        "TLS certificate issuer is not trusted (unknown CA). Add the issuing CA PEM under TLS trust · extra CA bundle; hostname bypass does not bypass CA validation".into()
     } else if combined.contains("Expired")
         || lower.contains("certificate has expired")
         || combined.contains("NotValidYet")
         || lower.contains("not valid yet")
     {
-        "TLS certificate has expired or is not yet valid; renew the server certificate. TLS verification cannot be disabled".into()
+        "TLS certificate has expired or is not yet valid; renew the server certificate. Hostname bypass does not bypass validity checks".into()
     } else if combined.contains("InvalidCertificate")
         || combined.contains("AlertReceived")
         || lower.contains("certificate")
         || lower.contains("handshake")
     {
-        "TLS handshake failed: server certificate or TLS parameters were rejected; TLS verification cannot be disabled".into()
+        "TLS handshake failed: server certificate or TLS parameters were rejected; hostname bypass does not bypass chain or signature checks".into()
     } else if matches!(err, ldap3::LdapError::Timeout { .. }) || lower.contains("timed out") {
         format!("Connection to {host} timed out; verify the endpoint host, port and firewall rules")
     } else if lower.contains("connection refused")
@@ -69,7 +69,7 @@ pub fn connect_error(err: &ldap3::LdapError, endpoint: &str) -> String {
     {
         format!("DNS lookup failed for {host}; verify the endpoint hostname")
     } else {
-        "LDAP connection failed; verify TLS trust, hostname, connectivity and access rights. TLS verification cannot be disabled".into()
+        "LDAP connection failed; verify TLS trust, hostname, connectivity and access rights".into()
     }
 }
 pub fn ldap_code_description(rc: u32) -> &'static str {
@@ -143,10 +143,18 @@ fn convert(raw: ldap3::ResultEntry) -> Entry {
 }
 pub fn tls_config(
     ca_bundle: &str,
+    skip_hostname: bool,
 ) -> Result<(Arc<rustls::ClientConfig>, crate::tls_observer::Slot), String> {
+    if skip_hostname && ca_bundle.trim().is_empty() {
+        return Err(
+            "Hostname verification bypass requires an explicit CA bundle; system roots alone are not allowed".into(),
+        );
+    }
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_native_certs::load_native_certs().certs {
-        let _ = roots.add(cert);
+    if !skip_hostname {
+        for cert in rustls_native_certs::load_native_certs().certs {
+            let _ = roots.add(cert);
+        }
     }
     if !ca_bundle.trim().is_empty() {
         let path = crate::model::expand_local_path(ca_bundle)
@@ -173,7 +181,8 @@ pub fn tls_config(
     let slot = Arc::new(std::sync::Mutex::new(
         crate::tls_observer::Capture::default(),
     ));
-    let verifier = crate::tls_observer::verifier(roots, slot.clone()).map_err(str::to_owned)?;
+    let verifier =
+        crate::tls_observer::verifier(roots, slot.clone(), skip_hostname).map_err(str::to_owned)?;
     let config = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -189,7 +198,13 @@ fn capture_for_profile(
     mut capture: crate::tls_observer::Capture,
 ) -> crate::tls_observer::Capture {
     capture.endpoint_host = capture_host(&profile.endpoint);
-    capture.trust_source = if profile.ca_bundle.trim().is_empty() {
+    capture.trust_source = if profile.tls_skip_hostname_verification {
+        let name = std::path::Path::new(&profile.ca_bundle)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("CA bundle");
+        format!("selected CA bundle · {name} (hostname check skipped)")
+    } else if profile.ca_bundle.trim().is_empty() {
         "system trust store".into()
     } else {
         let name = std::path::Path::new(&profile.ca_bundle)
@@ -224,7 +239,7 @@ impl Directory {
         profile: &Profile,
         password: &str,
     ) -> Result<(Self, crate::tls_observer::Capture), (String, crate::tls_observer::Capture)> {
-        let (config, slot) = tls_config(&profile.ca_bundle)
+        let (config, slot) = tls_config(&profile.ca_bundle, profile.tls_skip_hostname_verification)
             .map_err(|e| (e, capture_for_profile(profile, Default::default())))?;
         match Self::connect_with_config(profile, password, config).await {
             Ok(directory) => {

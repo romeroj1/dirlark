@@ -679,6 +679,22 @@ fn tls_rejects_unknown_ca_wrong_host_and_expired_certificate() {
         assert_eq!(unknown_capture.trust_source, "system trust store");
         assert!(!unknown_capture.chain.is_empty());
         assert!(server.operations.lock().unwrap().is_empty());
+        let untrusted_root = Mock::start("untrusted.example", false).await;
+        unknown.tls_skip_hostname_verification = true;
+        unknown.ca_bundle = untrusted_root._ca.path().to_string_lossy().into_owned();
+        let (unknown_bypass_err, unknown_bypass_capture) =
+            Directory::connect_observed(&unknown, "")
+                .await
+                .err()
+                .unwrap();
+        assert!(
+            unknown_bypass_err
+                .contains("hostname bypass does not bypass chain or signature checks")
+                || unknown_bypass_err.contains("unknown CA")
+                || unknown_bypass_err.contains("not trusted"),
+            "hostname bypass must not accept an untrusted certificate: {unknown_bypass_err}"
+        );
+        assert_eq!(unknown_bypass_capture.failure, Some("Untrusted issuer"));
         let wrong = Mock::start("wrong.example", false).await;
         let (wrong_err, wrong_capture) = Directory::connect_observed(&wrong.profile, "")
             .await
@@ -691,6 +707,14 @@ fn tls_rejects_unknown_ca_wrong_host_and_expired_certificate() {
         assert_eq!(wrong_capture.failure, Some("Hostname mismatch"));
         assert!(!wrong_capture.chain.is_empty());
         assert!(wrong.operations.lock().unwrap().is_empty());
+        let mut hostname_bypass = wrong.profile.clone();
+        hostname_bypass.tls_skip_hostname_verification = true;
+        let (mut connected, bypass_capture) = Directory::connect_observed(&hostname_bypass, "")
+            .await
+            .unwrap();
+        assert!(bypass_capture.failure.is_none());
+        assert!(!bypass_capture.chain.is_empty());
+        connected.disconnect().await;
         let expired = Mock::start("localhost", true).await;
         let (expired_err, expired_capture) = Directory::connect_observed(&expired.profile, "")
             .await
@@ -703,6 +727,15 @@ fn tls_rejects_unknown_ca_wrong_host_and_expired_certificate() {
         assert_eq!(expired_capture.failure, Some("Expired"));
         assert!(!expired_capture.chain.is_empty());
         assert!(expired.operations.lock().unwrap().is_empty());
+        let mut expired_bypass = expired.profile.clone();
+        expired_bypass.tls_skip_hostname_verification = true;
+        let (expired_bypass_err, expired_bypass_capture) =
+            Directory::connect_observed(&expired_bypass, "")
+                .await
+                .err()
+                .unwrap();
+        assert!(expired_bypass_err.contains("expired"));
+        assert_eq!(expired_bypass_capture.failure, Some("Expired"));
         let future = Mock::start_not_yet_valid("localhost").await;
         let (future_err, future_capture) = Directory::connect_observed(&future.profile, "")
             .await

@@ -11,6 +11,8 @@ pub struct Profile {
     pub bind_dn: String,
     pub ca_bundle: String,
     #[serde(default)]
+    pub tls_skip_hostname_verification: bool,
+    #[serde(default)]
     pub password_saved: bool,
 }
 impl Default for Profile {
@@ -22,12 +24,18 @@ impl Default for Profile {
             base_dn: String::new(),
             bind_dn: String::new(),
             ca_bundle: String::new(),
+            tls_skip_hostname_verification: false,
             password_saved: false,
         }
     }
 }
 impl Profile {
     pub fn validate(&self) -> Result<(), String> {
+        if self.tls_skip_hostname_verification && self.ca_bundle.trim().is_empty() {
+            return Err(
+                "Hostname verification bypass requires an explicit CA bundle; system roots alone are not allowed".into(),
+            );
+        }
         let u = url::Url::parse(&self.endpoint).map_err(|_| "Enter a valid LDAPS endpoint")?;
         if u.scheme() == "ldap" {
             return Err(
@@ -238,6 +246,26 @@ pub fn expand_local_path(raw: &str) -> Result<std::path::PathBuf, String> {
 mod tests {
     use super::*;
     #[test]
+    fn old_profile_json_defaults_hostname_bypass_to_off() {
+        let mut value = serde_json::to_value(Profile::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("tls_skip_hostname_verification");
+        let loaded: Profile = serde_json::from_value(value).unwrap();
+        assert!(!loaded.tls_skip_hostname_verification);
+        let enabled = Profile {
+            tls_skip_hostname_verification: true,
+            ..Profile::default()
+        };
+        let encoded = serde_json::to_string(&enabled).unwrap();
+        assert!(
+            serde_json::from_str::<Profile>(&encoded)
+                .unwrap()
+                .tls_skip_hostname_verification
+        );
+    }
+    #[test]
     fn credential_policy_includes_exact_names_patterns_and_options() {
         for name in CREDENTIAL_ATTRIBUTES.iter().copied().chain([
             "customPASSWORD",
@@ -336,6 +364,22 @@ mod tests {
             );
         }
         assert!(Profile::default().validate().is_ok());
+        let bypass_without_ca = Profile {
+            tls_skip_hostname_verification: true,
+            ..Profile::default()
+        };
+        assert!(
+            bypass_without_ca
+                .validate()
+                .unwrap_err()
+                .contains("explicit CA bundle")
+        );
+        let bypass_with_ca = Profile {
+            tls_skip_hostname_verification: true,
+            ca_bundle: "ca.pem".into(),
+            ..Profile::default()
+        };
+        assert!(bypass_with_ca.validate().is_ok());
     }
     #[test]
     fn filter_escapes_assertions() {
