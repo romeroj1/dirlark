@@ -1,4 +1,5 @@
-//! Captures peer certificates while delegating every trust decision to rustls WebPKI.
+//! Captures peer certificates and delegates chain/signature decisions to rustls WebPKI.
+//! Hostname matching is skipped only for an explicit profile opt-in with a dedicated CA bundle.
 use rustls::{
     DigitallySignedStruct, Error, RootCertStore, SignatureScheme,
     client::{
@@ -22,6 +23,9 @@ pub type Slot = Arc<Mutex<Capture>>;
 #[derive(Debug)]
 struct ObservingVerifier {
     delegate: Arc<WebPkiServerVerifier>,
+    roots: RootCertStore,
+    supported: rustls::crypto::WebPkiSupportedAlgorithms,
+    skip_hostname: bool,
     slot: Slot,
 }
 fn captured_chain(end: &CertificateDer<'_>, intermediates: &[CertificateDer<'_>]) -> Vec<Vec<u8>> {
@@ -47,15 +51,28 @@ impl ServerCertVerifier for ObservingVerifier {
         ocsp: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
-        // Record only bounded DER bytes. The delegate remains the sole source of trust decisions.
+        // Record only bounded DER bytes. Both paths use WebPKI chain verification; one also checks the name.
         if let Ok(mut state) = self.slot.lock() {
             state.chain = captured_chain(end, intermediates);
             state.failure = None;
             state.protocol = None;
         }
-        let result = self
-            .delegate
-            .verify_server_cert(end, intermediates, name, ocsp, now);
+        let result = if self.skip_hostname {
+            // This helper does not check revocation/OCSP or hostname. The bypass is therefore
+            // paired with a CA-bundle-only trust store; TLS handshake signatures are still delegated.
+            let cert = rustls::server::ParsedCertificate::try_from(end)?;
+            rustls::client::verify_server_cert_signed_by_trust_anchor(
+                &cert,
+                &self.roots,
+                intermediates,
+                now,
+                self.supported.all,
+            )
+            .map(|()| ServerCertVerified::assertion())
+        } else {
+            self.delegate
+                .verify_server_cert(end, intermediates, name, ocsp, now)
+        };
         if let Ok(mut state) = self.slot.lock() {
             state.failure = result.as_ref().err().map(failure_reason);
         }
@@ -105,17 +122,19 @@ impl ServerCertVerifier for ObservingVerifier {
 
 fn failure_reason(error: &Error) -> &'static str {
     match error {
-        Error::InvalidCertificate(error) => match error {
-            rustls::CertificateError::UnknownIssuer => "Untrusted issuer",
-            rustls::CertificateError::NotValidForName
-            | rustls::CertificateError::NotValidForNameContext { .. } => "Hostname mismatch",
-            rustls::CertificateError::Expired | rustls::CertificateError::ExpiredContext { .. } => {
-                "Expired"
+        Error::InvalidCertificate(error) => {
+            match error {
+                rustls::CertificateError::UnknownIssuer
+                | rustls::CertificateError::BadSignature => "Untrusted issuer",
+                rustls::CertificateError::NotValidForName
+                | rustls::CertificateError::NotValidForNameContext { .. } => "Hostname mismatch",
+                rustls::CertificateError::Expired
+                | rustls::CertificateError::ExpiredContext { .. } => "Expired",
+                rustls::CertificateError::NotValidYet
+                | rustls::CertificateError::NotValidYetContext { .. } => "Not yet valid",
+                _ => "Other verification failure",
             }
-            rustls::CertificateError::NotValidYet
-            | rustls::CertificateError::NotValidYetContext { .. } => "Not yet valid",
-            _ => "Other verification failure",
-        },
+        }
         _ => "Other verification failure",
     }
 }
@@ -123,14 +142,20 @@ fn failure_reason(error: &Error) -> &'static str {
 pub fn verifier(
     roots: RootCertStore,
     slot: Slot,
+    skip_hostname: bool,
 ) -> Result<Arc<dyn ServerCertVerifier>, &'static str> {
-    let delegate = WebPkiServerVerifier::builder_with_provider(
-        Arc::new(roots),
-        Arc::new(rustls::crypto::ring::default_provider()),
-    )
-    .build()
-    .map_err(|_| "TLS verifier setup failed")?;
-    Ok(Arc::new(ObservingVerifier { delegate, slot }))
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let delegate =
+        WebPkiServerVerifier::builder_with_provider(Arc::new(roots.clone()), provider.clone())
+            .build()
+            .map_err(|_| "TLS verifier setup failed")?;
+    Ok(Arc::new(ObservingVerifier {
+        delegate,
+        roots,
+        supported: provider.signature_verification_algorithms,
+        skip_hostname,
+        slot,
+    }))
 }
 
 #[cfg(test)]
@@ -172,6 +197,59 @@ mod tests {
         assert_eq!(
             failure_reason(&Error::General("unknownissuer.example".into())),
             "Other verification failure"
+        );
+    }
+
+    #[test]
+    fn hostname_bypass_still_requires_a_trusted_valid_certificate_chain() {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+        use rustls::pki_types::CertificateDer;
+
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+        let leaf_params = CertificateParams::new(vec!["directory.example.org".into()]).unwrap();
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+
+        let mut roots = RootCertStore::empty();
+        roots.add(CertificateDer::from(ca.der().to_vec())).unwrap();
+        let skip_verifier =
+            verifier(roots, Arc::new(Mutex::new(Capture::default())), true).unwrap();
+        let name = ServerName::try_from("replica.example.org").unwrap();
+        assert!(
+            skip_verifier
+                .verify_server_cert(
+                    &CertificateDer::from(leaf.der().to_vec()),
+                    &[],
+                    &name,
+                    &[],
+                    UnixTime::now()
+                )
+                .is_ok()
+        );
+
+        let mut untrusted = RootCertStore::empty();
+        let other_ca = CertificateParams::new(Vec::<String>::new())
+            .unwrap()
+            .self_signed(&KeyPair::generate().unwrap())
+            .unwrap();
+        untrusted
+            .add(CertificateDer::from(other_ca.der().to_vec()))
+            .unwrap();
+        let verifier = verifier(untrusted, Arc::new(Mutex::new(Capture::default())), true).unwrap();
+        assert!(
+            verifier
+                .verify_server_cert(
+                    &CertificateDer::from(leaf.der().to_vec()),
+                    &[],
+                    &name,
+                    &[],
+                    UnixTime::now()
+                )
+                .is_err()
         );
     }
 }

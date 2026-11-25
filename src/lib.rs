@@ -10,3 +10,4 @@ pub mod smoke;
 pub mod startup;
 pub mod tls_observer;
 pub mod ui;
+pub mod updater;
